@@ -1,3 +1,5 @@
+// index.js — Backend (Render): server-side fetch + cache, frontend reads from DB only
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -12,11 +14,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
-// Fixed CORS origin for Netlify frontend
+// Allow your Netlify site
 const FRONTEND_ORIGIN = "https://charming-dieffenbachia-a9e8f1.netlify.app";
-
-if (!DATABASE_URL) console.warn("WARNING: DATABASE_URL not set");
-if (!BIRDEYE_API_KEY) console.warn("WARNING: BIRDEYE_API_KEY not set (cron pulls will fail)");
 
 // ---------- DB ----------
 const pool = new Pool({
@@ -28,14 +27,16 @@ const pool = new Pool({
 const app = express();
 
 // --- CORS ---
-app.use(cors({
-  origin: FRONTEND_ORIGIN,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-cron-secret"]
-}));
+app.use(
+  cors({
+    origin: FRONTEND_ORIGIN,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-cron-secret"]
+  })
+);
 app.options("*", cors());
 
-// ---------- Allowlist ----------
+// ---------- Allowlist of token addresses you want to track ----------
 const TOKEN_ALLOWLIST = [
   "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2",
   "DitHyRMQiSDhn5cnKMJV2CDDt6sVct96YrECiM49pump",
@@ -59,7 +60,7 @@ const TOKEN_ALLOWLIST = [
   "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9"
 ];
 
-// ---------- Birdeye helpers ----------
+// ---------- Birdeye helpers (server-side only) ----------
 const BE_HEADERS = {
   accept: "application/json",
   "x-chain": "solana",
@@ -73,10 +74,18 @@ async function beJson(url) {
 }
 
 async function fetchTokenSnapshot(address) {
-  const overview = await beJson(`https://public-api.birdeye.so/defi/token_overview?address=${address}`);
-  const meta = await beJson(`https://public-api.birdeye.so/defi/v3/token/meta-data/single?address=${address}`);
-  const creation = await beJson(`https://public-api.birdeye.so/defi/token_creation_info?address=${address}`);
-  const security = await beJson(`https://public-api.birdeye.so/defi/token_security?address=${address}`);
+  const overview = await beJson(
+    `https://public-api.birdeye.so/defi/token_overview?address=${address}`
+  );
+  const meta = await beJson(
+    `https://public-api.birdeye.so/defi/v3/token/meta-data/single?address=${address}`
+  );
+  const creation = await beJson(
+    `https://public-api.birdeye.so/defi/token_creation_info?address=${address}`
+  );
+  const security = await beJson(
+    `https://public-api.birdeye.so/defi/token_security?address=${address}`
+  );
 
   return {
     address,
@@ -87,10 +96,14 @@ async function fetchTokenSnapshot(address) {
     marketcap: overview?.data?.marketCap ?? 0,
     liquidity: overview?.data?.liquidity ?? 0,
     volume24h: overview?.data?.v24hUSD ?? 0,
-    priceChange24h: Number(overview?.data?.priceChange24hPercent ?? 0).toFixed(2),
+    priceChange24h: Number(overview?.data?.priceChange24hPercent ?? 0),
     holders: overview?.data?.holder ?? 0,
-    top10HolderPercent: security?.data?.top10HolderPercent ? Number(security.data.top10HolderPercent * 100).toFixed(2) : null,
-    launchedAt: creation?.data?.blockHumanTime ? new Date(creation.data.blockHumanTime) : null
+    top10HolderPercent: security?.data?.top10HolderPercent
+      ? Number(security.data.top10HolderPercent * 100)
+      : null,
+    launchedAt: creation?.data?.blockHumanTime
+      ? new Date(creation.data.blockHumanTime)
+      : null
   };
 }
 
@@ -101,8 +114,8 @@ async function fetchHistoryPoints(address) {
   const json = await beJson(url);
   const items = json?.data?.items || [];
   return items
-    .map(p => ({ ts: new Date(p.unixTime * 1000).toISOString(), price: p.value }))
-    .filter(p => typeof p.price === "number" && p.price > 0);
+    .map((p) => ({ ts: new Date(p.unixTime * 1000).toISOString(), price: p.value }))
+    .filter((p) => typeof p.price === "number" && p.price > 0);
 }
 
 // ---------- DB helpers ----------
@@ -110,8 +123,7 @@ async function upsertTokenSnapshot(s) {
   const q = `
     insert into token_cache(address, symbol, name, logo, price, marketcap, liquidity, volume24h, priceChange24h, holders, top10HolderPercent, launchedAt, updated_at)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
-    on conflict (address)
-    do update set
+    on conflict (address) do update set
       symbol=excluded.symbol,
       name=excluded.name,
       logo=excluded.logo,
@@ -126,8 +138,18 @@ async function upsertTokenSnapshot(s) {
       updated_at=now()
   `;
   const vals = [
-    s.address, s.symbol, s.name, s.logo, s.price, s.marketcap, s.liquidity,
-    s.volume24h, s.priceChange24h, s.holders, s.top10HolderPercent, s.launchedAt
+    s.address,
+    s.symbol,
+    s.name,
+    s.logo,
+    s.price,
+    s.marketcap,
+    s.liquidity,
+    s.volume24h,
+    s.priceChange24h,
+    s.holders,
+    s.top10HolderPercent,
+    s.launchedAt
   ];
   await pool.query(q, vals);
 }
@@ -136,12 +158,16 @@ async function insertHistoryRows(address, rows) {
   if (!rows.length) return;
   const values = rows.map((r, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`).join(",");
   const params = [address];
-  rows.forEach(r => { params.push(r.ts); params.push(r.price); });
-  const q = `insert into token_history(address, ts, price) values ${values}`;
+  rows.forEach((r) => {
+    params.push(r.ts);
+    params.push(r.price);
+  });
+  const q = `insert into token_history(address, ts, price) values ${values}
+             on conflict (address, ts) do nothing`;
   await pool.query(q, params);
 }
 
-// ---------- CRON endpoint ----------
+// ---------- CRON: pull data server-side ----------
 app.post("/cron/pull", async (req, res) => {
   try {
     if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
@@ -151,27 +177,28 @@ app.post("/cron/pull", async (req, res) => {
       return res.status(500).json({ ok: false, error: "missing BIRDEYE_API_KEY" });
     }
 
+    let pulled = 0;
     for (const address of TOKEN_ALLOWLIST) {
       try {
         const snap = await fetchTokenSnapshot(address);
         await upsertTokenSnapshot(snap);
         const hist = await fetchHistoryPoints(address);
         if (hist.length) await insertHistoryRows(address, hist);
+        pulled++;
       } catch (e) {
         console.error("pull error for", address, e.message);
       }
-      await new Promise(r => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 120)); // small pacing
     }
-    res.json({ ok: true, pulled: TOKEN_ALLOWLIST.length });
+    res.json({ ok: true, pulled });
   } catch (e) {
     console.error("Cron pull failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------- Game round endpoint ----------
+// ---------- READ: round of 5, ready to render ----------
 app.get("/rounds/today", async (req, res) => {
-  console.log(`[HIT] /rounds/today from origin: ${req.headers.origin || "unknown"}`);
   try {
     const today = new Date().toISOString().slice(0, 10);
     const q = `
@@ -179,7 +206,16 @@ app.get("/rounds/today", async (req, res) => {
         address,
         symbol,
         name,
-        logo as "logoURI"
+        logo as "logoURI",
+        price,
+        marketcap,
+        liquidity,
+        volume24h,
+        priceChange24h,
+        holders,
+        top10HolderPercent,
+        launchedAt,
+        updated_at
       from token_cache
       order by random()
       limit 5
@@ -192,9 +228,47 @@ app.get("/rounds/today", async (req, res) => {
   }
 });
 
+// ---------- READ: one token snapshot ----------
+app.get("/tokens/:address", async (req, res) => {
+  try {
+    const { address } = req.params;
+    const q = `select address, symbol, name, logo as "logoURI", price, marketcap, liquidity, volume24h,
+                      priceChange24h, holders, top10HolderPercent, launchedAt, updated_at
+               from token_cache where address = $1`;
+    const { rows } = await pool.query(q, [address]);
+    if (!rows.length) return res.status(404).json({ error: "not found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("Error fetching token:", e);
+    res.status(500).json({ error: "Failed to fetch token" });
+  }
+});
 
-// ---------- Health endpoint ----------
-app.get("/health", async (req, res) => {
+// ---------- READ: time series for charts ----------
+app.get("/tokens/:address/history", async (req, res) => {
+  try {
+    const { address } = req.params;
+    const window = (req.query.window || "24h").toLowerCase(); // 24h, 7d, 30d
+    let since = "now() - interval '24 hours'";
+    if (window === "7d") since = "now() - interval '7 days'";
+    if (window === "30d") since = "now() - interval '30 days'";
+
+    const q = `
+      select ts, price
+      from token_history
+      where address = $1 and ts >= ${since}
+      order by ts asc
+    `;
+    const { rows } = await pool.query(q, [address]);
+    res.json({ address, points: rows });
+  } catch (e) {
+    console.error("Error fetching history:", e);
+    res.status(500).json({ error: "Failed to fetch history" });
+  }
+});
+
+// ---------- Health ----------
+app.get("/health", async (_req, res) => {
   try {
     await pool.query("select now()");
     res.json({ ok: true });
@@ -203,30 +277,11 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// ---------- Start server ----------
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
-  if (BIRDEYE_API_KEY) {
-    console.log("Auto-pull enabled (every 10 min)");
-    setInterval(async () => {
-      try {
-        console.log("Auto-pull: fetching tokens...");
-        for (const address of TOKEN_ALLOWLIST) {
-          const snap = await fetchTokenSnapshot(address);
-          await upsertTokenSnapshot(snap);
-          const hist = await fetchHistoryPoints(address);
-          if (hist.length) await insertHistoryRows(address, hist);
-          await new Promise(r => setTimeout(r, 120));
-        }
-        console.log("Auto-pull complete.");
-      } catch (err) {
-        console.error("Auto-pull failed:", err.message);
-      }
-    }, 10 * 60 * 1000);
-  } else {
-    console.log("Auto-pull disabled: missing BIRDEYE_API_KEY");
-  }
 });
+
 
 
 
