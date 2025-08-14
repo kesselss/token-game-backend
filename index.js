@@ -10,8 +10,11 @@ dotenv.config();
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
-const FRONTEND_ORIGIN_RAW = process.env.FRONTEND_ORIGIN || "*";
 const CRON_SECRET = process.env.CRON_SECRET || "";
+
+// Remove any trailing slash from FRONTEND_ORIGIN
+let FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+FRONTEND_ORIGIN = FRONTEND_ORIGIN.replace(/\/$/, "");
 
 if (!DATABASE_URL) console.warn("WARNING: DATABASE_URL not set");
 if (!BIRDEYE_API_KEY) console.warn("WARNING: BIRDEYE_API_KEY not set (cron pulls will fail)");
@@ -26,25 +29,18 @@ const pool = new Pool({
 const app = express();
 
 // --- CORS ---
-const FRONTEND_ORIGIN = FRONTEND_ORIGIN_RAW.replace(/\/$/, "");
-const corsOptions = {
+app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
     const cleaned = origin.replace(/\/$/, "");
     if (FRONTEND_ORIGIN === "*" || cleaned === FRONTEND_ORIGIN) return cb(null, true);
-    return cb(null, false);
+    return cb(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-cron-secret"]
-};
-app.use((req, _res, next) => {
-  if (req.headers.origin) console.log("Request Origin:", req.headers.origin);
-  next();
-});
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+}));
+app.options("*", cors());
 
-app.use(express.json());
 
 // ---------- Allowlist ----------
 const TOKEN_ALLOWLIST = [
