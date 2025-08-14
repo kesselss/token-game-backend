@@ -1,15 +1,17 @@
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import fetch from "node-fetch";
 import pkg from "pg";
 const { Pool } = pkg;
 
 // ---------- ENV ----------
+dotenv.config();
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";     // set in Railway
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";    // set to your Netlify origin later
-const CRON_SECRET = process.env.CRON_SECRET || "";             // set any random string in Railway
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
+const FRONTEND_ORIGIN_RAW = process.env.FRONTEND_ORIGIN || "*";
+const CRON_SECRET = process.env.CRON_SECRET || "";
 
 if (!DATABASE_URL) console.warn("WARNING: DATABASE_URL not set");
 if (!BIRDEYE_API_KEY) console.warn("WARNING: BIRDEYE_API_KEY not set (cron pulls will fail)");
@@ -22,10 +24,29 @@ const pool = new Pool({
 
 // ---------- APP ----------
 const app = express();
-app.use(cors({ origin: FRONTEND_ORIGIN }));
+
+// --- CORS ---
+const FRONTEND_ORIGIN = FRONTEND_ORIGIN_RAW.replace(/\/$/, "");
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    const cleaned = origin.replace(/\/$/, "");
+    if (FRONTEND_ORIGIN === "*" || cleaned === FRONTEND_ORIGIN) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-cron-secret"]
+};
+app.use((req, _res, next) => {
+  if (req.headers.origin) console.log("Request Origin:", req.headers.origin);
+  next();
+});
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json());
 
-// ---------- Allowlist (from your app.js) ----------
+// ---------- Allowlist ----------
 const TOKEN_ALLOWLIST = [
   "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2",
   "DitHyRMQiSDhn5cnKMJV2CDDt6sVct96YrECiM49pump",
@@ -63,13 +84,9 @@ async function beJson(url) {
 }
 
 async function fetchTokenSnapshot(address) {
-  // overview
   const overview = await beJson(`https://public-api.birdeye.so/defi/token_overview?address=${address}`);
-  // metadata
   const meta = await beJson(`https://public-api.birdeye.so/defi/v3/token/meta-data/single?address=${address}`);
-  // creation
   const creation = await beJson(`https://public-api.birdeye.so/defi/token_creation_info?address=${address}`);
-  // security
   const security = await beJson(`https://public-api.birdeye.so/defi/token_security?address=${address}`);
 
   return {
@@ -99,7 +116,7 @@ async function fetchHistoryPoints(address) {
     .filter(p => typeof p.price === "number" && p.price > 0);
 }
 
-// ---------- Upserts ----------
+// ---------- DB helpers ----------
 async function upsertTokenSnapshot(s) {
   const q = `
     insert into token_cache(address, symbol, name, logo, price, marketcap, liquidity, volume24h, priceChange24h, holders, top10HolderPercent, launchedAt, updated_at)
@@ -135,7 +152,7 @@ async function insertHistoryRows(address, rows) {
   await pool.query(q, params);
 }
 
-// ---------- CRON endpoint (every 10 minutes) ----------
+// ---------- CRON endpoint ----------
 app.post("/cron/pull", async (req, res) => {
   try {
     if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
@@ -145,148 +162,71 @@ app.post("/cron/pull", async (req, res) => {
       return res.status(500).json({ ok: false, error: "missing BIRDEYE_API_KEY" });
     }
 
-    // pull & upsert for every token in allowlist
     for (const address of TOKEN_ALLOWLIST) {
       try {
         const snap = await fetchTokenSnapshot(address);
         await upsertTokenSnapshot(snap);
-        // optional history
         const hist = await fetchHistoryPoints(address);
         if (hist.length) await insertHistoryRows(address, hist);
       } catch (e) {
         console.error("pull error for", address, e.message);
       }
-      // small spacing just in case
       await new Promise(r => setTimeout(r, 120));
     }
     res.json({ ok: true, pulled: TOKEN_ALLOWLIST.length });
   } catch (e) {
-    console.error(e);
+    console.error("Cron pull failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------- Public endpoints ----------
-
-// Health
-app.get("/healthz", async (_req, res) => {
+// ---------- Game round endpoint ----------
+app.get("/rounds/today", async (req, res) => {
+  console.log(`[HIT] /rounds/today from origin: ${req.headers.origin || "unknown"}`);
   try {
-    const r = await pool.query("select now()");
-    res.json({ status: "ok", time: r.rows[0].now });
-  } catch (e) {
-    res.status(500).json({ status: "error", error: e.message });
-  }
-});
-
-// 5 random tokens for today's round, served from cache
-app.get("/rounds/today", async (_req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      select * from token_cache
-      where address = any($1)
+    const today = new Date().toISOString().slice(0, 10);
+    const q = `
+      select symbol, name, logo as logoURI
+      from token_cache
       order by random()
-      limit 5
-    `, [TOKEN_ALLOWLIST]);
-    const todayUTC = new Date().toISOString().slice(0, 10);
+      limit 2
+    `;
+    const result = await pool.query(q);
     res.json({
-      round_date: todayUTC,
-      tokens: rows.map(r => ({
-        address: r.address,
-        symbol: r.symbol,
-        name: r.name,
-        logo: r.logo,
-        price: Number(r.price) || 0,
-        marketcap: Number(r.marketcap) || 0,
-        liquidity: Number(r.liquidity) || 0,
-        volume24h: Number(r.volume24h) || 0,
-        priceChange24h: Number(r.priceChange24h || 0).toFixed(2),
-        holders: Number(r.holders) || 0,
-        top10HolderPercent: r.top10holderpercent !== null ? Number(r.top10holderpercent).toFixed(2) : "0",
-        launchedAt: r.launchedat ? new Date(r.launchedat).toISOString() : null
-      }))
+      round_date: today,
+      tokens: result.rows
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    console.error("Error fetching round:", e);
+    res.status(500).json({ error: "Failed to fetch round" });
   }
 });
 
-// One token snapshot (latest) from cache
-app.get("/token/:address", async (req, res) => {
-  try {
-    const { rows } = await pool.query("select * from token_cache where address=$1", [req.params.address]);
-    if (!rows.length) return res.status(404).json({ error: "not found" });
-    const r = rows[0];
-    res.json({
-      address: r.address,
-      symbol: r.symbol,
-      name: r.name,
-      logo: r.logo,
-      price: Number(r.price) || 0,
-      marketcap: Number(r.marketcap) || 0,
-      liquidity: Number(r.liquidity) || 0,
-      volume24h: Number(r.volume24h) || 0,
-      priceChange24h: Number(r.priceChange24h || 0).toFixed(2),
-      holders: Number(r.holders) || 0,
-      top10HolderPercent: r.top10holderpercent !== null ? Number(r.top10holderpercent).toFixed(2) : "0",
-      launchedAt: r.launchedat ? new Date(r.launchedat).toISOString() : null
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Simple history (last 48 points if present)
-app.get("/token/:address/history", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "select ts, price from token_history where address=$1 order by ts desc limit 48",
-      [req.params.address]
-    );
-    // Return oldest -> newest for chart
-    res.json(rows.reverse().map(r => ({ time: r.ts, price: Number(r.price) })));
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ... your existing imports and setup ...
-
-// ---------- Auto-run cron every 10 minutes ----------
-async function autoPullLoop() {
-  if (!BIRDEYE_API_KEY) {
-    console.warn("Auto-pull disabled: missing BIRDEYE_API_KEY");
-    return;
-  }
-  while (true) {
-    try {
-      console.log("Auto-pull: starting token refresh...");
-      // pull & upsert for every token in allowlist
-      for (const address of TOKEN_ALLOWLIST) {
-        try {
+// ---------- Start server ----------
+app.listen(PORT, () => {
+  console.log(`API listening on ${PORT}`);
+  if (BIRDEYE_API_KEY) {
+    console.log("Auto-pull enabled (every 10 min)");
+    setInterval(async () => {
+      try {
+        console.log("Auto-pull: fetching tokens...");
+        for (const address of TOKEN_ALLOWLIST) {
           const snap = await fetchTokenSnapshot(address);
           await upsertTokenSnapshot(snap);
           const hist = await fetchHistoryPoints(address);
           if (hist.length) await insertHistoryRows(address, hist);
-        } catch (e) {
-          console.error("auto-pull error for", address, e.message);
+          await new Promise(r => setTimeout(r, 120));
         }
-        // short delay between requests
-        await new Promise(r => setTimeout(r, 120));
+        console.log("Auto-pull complete.");
+      } catch (err) {
+        console.error("Auto-pull failed:", err.message);
       }
-      console.log("Auto-pull: completed");
-    } catch (e) {
-      console.error("Auto-pull loop error:", e);
-    }
-    // wait 10 minutes
-    await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+    }, 10 * 60 * 1000);
+  } else {
+    console.log("Auto-pull disabled: missing BIRDEYE_API_KEY");
   }
-}
-
-// Start the loop after the server starts
-app.listen(PORT, () => {
-  console.log(`API listening on ${PORT}`);
-  autoPullLoop(); // kick off background loop
 });
+
+
 
 
