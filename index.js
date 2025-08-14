@@ -1,7 +1,3 @@
-# We'll write updated files: app.js, index.js, and a schema.sql for DB.
-from pathlib import Path
-
-index_js = r"""// index.js — Backend with Plays & Leaderboard
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
