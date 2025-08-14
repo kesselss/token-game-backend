@@ -250,5 +250,43 @@ app.get("/token/:address/history", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+// ... your existing imports and setup ...
+
+// ---------- Auto-run cron every 10 minutes ----------
+async function autoPullLoop() {
+  if (!BIRDEYE_API_KEY) {
+    console.warn("Auto-pull disabled: missing BIRDEYE_API_KEY");
+    return;
+  }
+  while (true) {
+    try {
+      console.log("Auto-pull: starting token refresh...");
+      // pull & upsert for every token in allowlist
+      for (const address of TOKEN_ALLOWLIST) {
+        try {
+          const snap = await fetchTokenSnapshot(address);
+          await upsertTokenSnapshot(snap);
+          const hist = await fetchHistoryPoints(address);
+          if (hist.length) await insertHistoryRows(address, hist);
+        } catch (e) {
+          console.error("auto-pull error for", address, e.message);
+        }
+        // short delay between requests
+        await new Promise(r => setTimeout(r, 120));
+      }
+      console.log("Auto-pull: completed");
+    } catch (e) {
+      console.error("Auto-pull loop error:", e);
+    }
+    // wait 10 minutes
+    await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+  }
+}
+
+// Start the loop after the server starts
+app.listen(PORT, () => {
+  console.log(`API listening on ${PORT}`);
+  autoPullLoop(); // kick off background loop
+});
+
 
