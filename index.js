@@ -119,38 +119,42 @@ async function fetchHistoryPoints(address) {
 
 // ---------- DB helpers ----------
 async function upsertTokenSnapshot(s) {
-  const q = `
-    insert into token_cache(address, symbol, name, logo, price, marketcap, liquidity, volume24h, priceChange24h, holders, top10HolderPercent, launchedAt, updated_at)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
-    on conflict (address) do update set
-      symbol=excluded.symbol,
-      name=excluded.name,
-      logo=excluded.logo,
-      price=excluded.price,
-      marketcap=excluded.marketcap,
-      liquidity=excluded.liquidity,
-      volume24h=excluded.volume24h,
-      priceChange24h=excluded.priceChange24h,
-      holders=excluded.holders,
-      top10HolderPercent=excluded.top10HolderPercent,
-      launchedAt=excluded.launchedAt,
-      updated_at=now()
-  `;
-  const vals = [
-    s.address,
-    s.symbol,
-    s.name,
-    s.logo,
-    s.price,
-    s.marketcap,
-    s.liquidity,
-    s.volume24h,
-    s.priceChange24h,
-    s.holders,
-    s.top10HolderPercent,
-    s.launchedAt
-  ];
-  await pool.query(q, vals);
+const q = `
+  insert into token_cache(
+    address, symbol, name, logo, price, marketcap, liquidity, volume24h,
+    priceChange24h, holders, top10HolderPercent, launchedAt, updated_at
+  )
+  values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+  on conflict (address) do update set
+    symbol=excluded.symbol,
+    name=excluded.name,
+    logo=excluded.logo,
+    price=excluded.price,
+    marketcap=excluded.marketcap,
+    liquidity=excluded.liquidity,
+    volume24h=excluded.volume24h,
+    priceChange24h=excluded.priceChange24h,
+    holders=excluded.holders,
+    top10HolderPercent=excluded.top10HolderPercent,
+    launchedAt=excluded.launchedAt,
+    updated_at=now()
+`;
+const vals = [
+  s.address,
+  s.symbol,
+  s.name,
+  s.logo,
+  s.price,
+  s.marketcap,
+  s.liquidity,
+  s.volume24h,
+  s.priceChange24h,
+  s.holders,
+  s.top10HolderPercent,
+  s.launchedAt
+];
+await pool.query(q, vals);
+
 }
 
 async function insertHistoryRows(address, rows) {
@@ -200,25 +204,26 @@ app.post("/cron/pull", async (req, res) => {
 app.get("/rounds/today", async (_req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const q = `
-      select
-        address,
-        symbol,
-        name,
-        logo as "logoURI",
-        price,
-        marketcap,
-        liquidity,
-        volume24h,
-        priceChange24h,
-        holders,
-        top10HolderPercent,
-        launchedAt,
-        updated_at
-      from token_cache
-      order by random()
-      limit 5
-    `;
+const q = `
+  select
+    address,
+    symbol,
+    name,
+    logo as "logoURI",
+    price,
+    marketcap,
+    liquidity,
+    volume24h,
+    priceChange24h as "priceChange24h",
+    holders,
+    top10HolderPercent as "top10HolderPercent",
+    launchedAt as "launchedAt",
+    updated_at
+  from token_cache
+  order by random()
+  limit 5
+`;
+
     const result = await pool.query(q);
     res.json({ round_date: today, tokens: result.rows });
   } catch (e) {
