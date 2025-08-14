@@ -175,21 +175,23 @@ app.get("/rounds/today", async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const q = `
-      select symbol, name, logo as logoURI
+      select
+        address,
+        symbol,
+        name,
+        logo as "logoURI"
       from token_cache
       order by random()
-      limit 2
+      limit 5
     `;
     const result = await pool.query(q);
-    res.json({
-      round_date: today,
-      tokens: result.rows
-    });
+    res.json({ round_date: today, tokens: result.rows });
   } catch (e) {
     console.error("Error fetching round:", e);
     res.status(500).json({ error: "Failed to fetch round" });
   }
 });
+
 
 // ---------- Health endpoint ----------
 app.get("/health", async (req, res) => {
