@@ -311,9 +311,8 @@ app.post("/plays", async (req, res) => {
 app.get("/leaderboard", async (req, res) => {
   try {
     const now = new Date();
-    const y = new Date(now.getTime() - 24*60*60*1000);
-    const defaultDay = y.toISOString().slice(0,10);
-    const day = (req.query.round_date || defaultDay);
+    const today = now.toISOString().slice(0,10);
+    const day = (req.query.round_date || today);
 
     // latest submission per player for that day
     const q = `
