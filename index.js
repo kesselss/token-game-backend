@@ -12,9 +12,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
-// Remove any trailing slash from FRONTEND_ORIGIN
-let FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
-FRONTEND_ORIGIN = FRONTEND_ORIGIN.replace(/\/$/, "");
+// Fixed CORS origin for Netlify frontend
+const FRONTEND_ORIGIN = "https://charming-dieffenbachia-a9e8f1.netlify.app";
 
 if (!DATABASE_URL) console.warn("WARNING: DATABASE_URL not set");
 if (!BIRDEYE_API_KEY) console.warn("WARNING: BIRDEYE_API_KEY not set (cron pulls will fail)");
@@ -30,17 +29,11 @@ const app = express();
 
 // --- CORS ---
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    const cleaned = origin.replace(/\/$/, "");
-    if (FRONTEND_ORIGIN === "*" || cleaned === FRONTEND_ORIGIN) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
-  },
+  origin: FRONTEND_ORIGIN,
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-cron-secret"]
 }));
 app.options("*", cors());
-
 
 // ---------- Allowlist ----------
 const TOKEN_ALLOWLIST = [
@@ -195,6 +188,16 @@ app.get("/rounds/today", async (req, res) => {
   } catch (e) {
     console.error("Error fetching round:", e);
     res.status(500).json({ error: "Failed to fetch round" });
+  }
+});
+
+// ---------- Health endpoint ----------
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("select now()");
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
