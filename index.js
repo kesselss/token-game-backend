@@ -1,5 +1,7 @@
-// index.js — Backend (Render): server-side fetch + cache, frontend reads from DB only
+# We'll write updated files: app.js, index.js, and a schema.sql for DB.
+from pathlib import Path
 
+index_js = r"""// index.js — Backend with Plays & Leaderboard
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -14,8 +16,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
-// Allow your Netlify site
-const FRONTEND_ORIGIN = "https://charming-dieffenbachia-a9e8f1.netlify.app";
+// Allow your Netlify site (adjust as needed)
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://charming-dieffenbachia-a9e8f1.netlify.app";
 
 // ---------- DB ----------
 const pool = new Pool({
@@ -25,6 +27,7 @@ const pool = new Pool({
 
 // ---------- APP ----------
 const app = express();
+app.use(express.json({ limit: "1mb" }));
 
 // --- CORS ---
 app.use(
@@ -198,7 +201,7 @@ app.post("/cron/pull", async (req, res) => {
 });
 
 // ---------- READ: round of 5, ready to render ----------
-app.get("/rounds/today", async (req, res) => {
+app.get("/rounds/today", async (_req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const q = `
@@ -267,6 +270,69 @@ app.get("/tokens/:address/history", async (req, res) => {
   }
 });
 
+// ---------- WRITE: submit a play ----------
+app.post("/plays", async (req, res) => {
+  try {
+    const { player, selections } = req.body || {};
+    if (!player || !Array.isArray(selections) || selections.length === 0) {
+      return res.status(400).json({ ok: false, error: "player and selections required" });
+    }
+    // sanitize
+    const name = String(player).slice(0, 32);
+    const safeSelections = selections
+      .slice(0, 10) // safety cap
+      .map(s => ({
+        address: String(s.address || ""),
+        symbol: String(s.symbol || ""),
+        name: String(s.name || ""),
+        logoURI: String(s.logoURI || ""),
+        direction: s.direction === "short" ? "short" : "long"
+      }));
+
+    const longs = safeSelections.filter(s => s.direction === "long").length;
+    const shorts = safeSelections.filter(s => s.direction === "short").length;
+
+    // UTC round date (reset at 00:00 UTC)
+    const round_date = new Date().toISOString().slice(0, 10);
+
+    const q = `insert into plays(player, round_date, selections, longs, shorts, pnl, created_at)
+               values ($1, $2, $3, $4, $5, 0, now())
+               returning id`;
+    const { rows } = await pool.query(q, [name, round_date, JSON.stringify(safeSelections), longs, shorts]);
+    res.json({ ok: true, id: rows[0].id, round_date, longs, shorts });
+  } catch (e) {
+    console.error("Error inserting play:", e);
+    res.status(500).json({ ok: false, error: "Failed to save play" });
+  }
+});
+
+// ---------- READ: leaderboard (yesterday UTC by default) ----------
+app.get("/leaderboard", async (req, res) => {
+  try {
+    const now = new Date();
+    const y = new Date(now.getTime() - 24*60*60*1000);
+    const defaultDay = y.toISOString().slice(0,10);
+    const day = (req.query.round_date || defaultDay);
+
+    // latest submission per player for that day
+    const q = `
+      select distinct on (player)
+        player, longs, shorts, coalesce(pnl, 0) as pnl, created_at
+      from plays
+      where round_date = $1
+      order by player, created_at desc
+      limit 200
+    `;
+    const { rows } = await pool.query(q, [day]);
+    // sort by pnl desc, then earlier created_at (tie-breaker)
+    rows.sort((a,b) => (b.pnl - a.pnl) || (a.created_at - b.created_at));
+    res.json({ round_date: day, entries: rows });
+  } catch (e) {
+    console.error("Error loading leaderboard:", e);
+    res.status(500).json({ error: "Failed to fetch leaderboard" });
+  }
+});
+
 // ---------- Health ----------
 app.get("/health", async (_req, res) => {
   try {
@@ -281,7 +347,6 @@ app.get("/health", async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
 });
-
 
 
 
