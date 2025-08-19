@@ -46,6 +46,7 @@ const pool = new Pool({
 const app = express();
 // ------ Telegram Mini App auth verification (fixed) ------
 // Function to verify Telegram initData
+// Function to verify Telegram initData
 function verifyTelegramInitData(initData, botToken) {
   if (!initData || !botToken) {
     return null;
@@ -53,10 +54,15 @@ function verifyTelegramInitData(initData, botToken) {
 
   // Find the hash and remove it from the data string
   const urlParams = new URLSearchParams(initData);
+  
+  // Explicitly get the hash parameter
   const receivedHash = urlParams.get('hash');
+  
+  // Make sure to remove both hash and signature before computing the check string
   urlParams.delete('hash');
+  urlParams.delete('signature');
 
-  // Create a sorted array of key=value pairs, excluding hash
+  // Create a sorted array of key=value pairs, excluding hash and signature
   const dataCheckString = Array.from(urlParams.entries())
     .sort(([keyA], [keyB]) => keyA.localeCompare(keyB))
     .map(([key, value]) => `${key}=${value}`)
