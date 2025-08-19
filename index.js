@@ -449,30 +449,31 @@ app.post("/plays", async (req, res) => {
 
 
 // ---------- READ: leaderboard (yesterday UTC by default) ----------
+// ---------- READ: leaderboard ----------
 app.get("/leaderboard", async (req, res) => {
   try {
-    const now = new Date();
-    const today = now.toISOString().slice(0,10);
-    const day = (req.query.round_date || today);
-
-    // latest submission per player for that day
+    // Get the most recent play for each user
     const q = `
-      select distinct on (player)
-        player, longs, shorts, coalesce(pnl, 0) as pnl, created_at
-      from plays
-      where round_date = $1
-      order by player, created_at desc
-      limit 200
+      SELECT DISTINCT ON (user_id)
+        user_id,
+        username,
+        selections,
+        timestamp
+      FROM plays
+      ORDER BY user_id, timestamp DESC
+      LIMIT 200
     `;
-    const { rows } = await pool.query(q, [day]);
-    // sort by pnl desc, then earlier created_at (tie-breaker)
-    rows.sort((a,b) => (b.pnl - a.pnl) || (a.created_at - b.created_at));
-    res.json({ round_date: day, entries: rows });
+
+    const { rows } = await pool.query(q);
+
+    // For now, just return them as-is
+    res.json({ entries: rows });
   } catch (e) {
     console.error("Error loading leaderboard:", e);
     res.status(500).json({ error: "Failed to fetch leaderboard" });
   }
 });
+
 
 // ---------- Telegram Webhook ----------
 app.post("/telegram/webhook", async (req, res) => {
