@@ -73,7 +73,7 @@ function verifyTelegramInitData(initData, botToken) {
     const dataCheckString = filtered.join("\n");
 
     // 5. Compute HMAC
-    const secret = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+    const secret = crypto.createHmac("sha256", botToken).update("WebAppData").digest();
     const computedHash = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
 
     if (computedHash !== receivedHash) {
