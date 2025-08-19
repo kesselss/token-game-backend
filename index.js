@@ -50,58 +50,44 @@ const app = express();
 // Returns the parsed Telegram user object on success, or null on failure.
 // Verifies Telegram WebApp initData using the bot token.
 // Returns the parsed Telegram user object on success, or null on failure.
-function verifyTelegramInitData(initData, botToken) {
+// Verify Telegram initData manually
+function verifyTelegramInitData(botToken, telegramInitData) {
   try {
-    if (!initData || !botToken) return null;
+    const initData = new URLSearchParams(telegramInitData);
+    initData.sort();
 
-    // 1. Split into raw pairs, don't decode yet
-    const pairs = initData.split("&").filter(Boolean);
+    const hash = initData.get("hash");
+    if (!hash) return null;
+    initData.delete("hash");
 
-    // 2. Extract and remove hash
-    const hashPair = pairs.find(p => p.startsWith("hash="));
-    if (!hashPair) return null;
-    const receivedHash = decodeURIComponent(hashPair.split("=").slice(1).join("="));
+    const dataToCheck = [...initData.entries()]
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n");
 
-    const filtered = pairs.filter(p => !p.startsWith("hash=") && !p.startsWith("signature="));
-
-    // 3. Sort by decoded key, but keep raw "k=v"
-    filtered.sort((a, b) => {
-      const ka = decodeURIComponent(a.split("=")[0]);
-      const kb = decodeURIComponent(b.split("=")[0]);
-      return ka.localeCompare(kb);
-    });
-
-    // 4. Join with \n (exact raw values)
-    const dataCheckString = filtered.join("\n");
-
-    // 5. Compute HMAC with correct order
-    const secret = crypto.createHmac("sha256", "WebAppData")
+    // Correct secret key derivation
+    const secretKey = crypto
+      .createHmac("sha256", "WebAppData")
       .update(botToken)
       .digest();
 
-    const computedHash = crypto.createHmac("sha256", secret)
-      .update(dataCheckString)
+    const computedHash = crypto
+      .createHmac("sha256", secretKey)
+      .update(dataToCheck)
       .digest("hex");
 
-    if (computedHash !== receivedHash) {
-      console.error("Hash validation failed.");
-      console.log("Received Hash:", receivedHash);
-      console.log("Computed Hash:", computedHash);
-      console.log("Data Check String:", dataCheckString);
+    if (computedHash !== hash) {
+      console.error("Hash mismatch:", computedHash, "vs", hash);
       return null;
     }
 
-    // 6. Parse user
-    const userPair = filtered.find(p => p.startsWith("user="));
-    if (!userPair) return null;
-    const userJson = decodeURIComponent(userPair.split("=").slice(1).join("="));
-    return JSON.parse(userJson);
-
+    const user = JSON.parse(decodeURIComponent(initData.get("user") || ""));
+    return user;
   } catch (err) {
-    console.error("Error in verifyTelegramInitData:", err);
+    console.error("Error validating init data:", err);
     return null;
   }
 }
+
 
 
 
@@ -123,8 +109,8 @@ function telegramAuth(req, _res, next) {
   }
 
   // IMPORTANT: pass BOT_TOKEN and assign the returned user object directly
-  const user = verifyTelegramInitData(initData, BOT_TOKEN);
-  req.tgUser = user || null;
+const user = verifyTelegramInitData(BOT_TOKEN, initData);
+req.tgUser = user || null;
 
   // Optional debug
   console.log("[telegramAuth] hasInitData:", Boolean(initData), "user:", req.tgUser);
