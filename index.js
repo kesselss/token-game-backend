@@ -368,53 +368,53 @@ app.get("/tokens/:address/history", async (req, res) => {
   }
 });
 
-// ---------- WRITE: submit a play ----------
+// ---------- WRITE: submit a play (with debug logs) ----------
 app.post("/plays", telegramAuth, async (req, res) => {
   try {
-    // Require TG user in production; allow fallback locally if you want
+    console.log("[/plays] body:", req.body);
+    console.log("[/plays] tgUser:", req.tgUser);
+
     if (!req.tgUser) {
-      return res.status(401).json({ ok: false, error: "unauthorized (Telegram initData missing/invalid)" });
+      return res.status(401).json({ ok: false, error: "unauthorized: missing/invalid Telegram initData" });
     }
 
     const { selections } = req.body || {};
     if (!Array.isArray(selections) || selections.length === 0) {
-      return res.status(400).json({ ok: false, error: "selections required" });
+      return res.status(400).json({ ok: false, error: "selections required (non-empty array)" });
     }
 
-    // sanitize selections
-    const safeSelections = selections
-      .slice(0, 10)
-      .map(s => ({
-        address: String(s.address || ""),
-        symbol: String(s.symbol || ""),
-        name: String(s.name || ""),
-        logoURI: String(s.logoURI || ""),
-        direction: s.direction === "short" ? "short" : "long"
-      }));
+    const safeSelections = selections.slice(0, 10).map(s => ({
+      address: String(s.address || ""),
+      symbol: String(s.symbol || ""),
+      name: String(s.name || ""),
+      logoURI: String(s.logoURI || ""),
+      direction: s.direction === "short" ? "short" : "long"
+    }));
 
     const longs = safeSelections.filter(s => s.direction === "long").length;
     const shorts = safeSelections.filter(s => s.direction === "short").length;
 
-    // identity from Telegram
     const tgId = String(req.tgUser.id);
-    const player =
-      req.tgUser.username ? `@${req.tgUser.username}` :
-      (req.tgUser.first_name || "anon");
-
-    // UTC round date
+    const player = req.tgUser.username ? `@${req.tgUser.username}` : (req.tgUser.first_name || "anon");
     const round_date = new Date().toISOString().slice(0, 10);
 
-    const q = `insert into plays(telegram_id, player, round_date, selections, longs, shorts, pnl, created_at)
-               values ($1,$2,$3,$4,$5,$6,0,now())
-               returning id`;
-    const { rows } = await pool.query(q, [tgId, player, round_date, JSON.stringify(safeSelections), longs, shorts]);
+    const q = `
+      insert into plays(telegram_id, player, round_date, selections, longs, shorts, pnl, created_at)
+      values ($1,$2,$3,$4,$5,$6,0,now())
+      returning id
+    `;
+    const params = [tgId, player, round_date, JSON.stringify(safeSelections), longs, shorts];
+
+    const { rows } = await pool.query(q, params);
+    console.log("[/plays] insert ok id=", rows[0]?.id);
 
     res.json({ ok: true, id: rows[0].id, round_date, longs, shorts, player, telegram_id: tgId });
   } catch (e) {
-    console.error("Error inserting play:", e);
-    res.status(500).json({ ok: false, error: "Failed to save play" });
+    console.error("[/plays] error:", e);
+    res.status(500).json({ ok: false, error: e.message || "Failed to save play" });
   }
 });
+
 
 
 // ---------- READ: leaderboard (yesterday UTC by default) ----------
