@@ -3,6 +3,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import pkg from "pg";
+import crypto from "crypto";
+
 const { Pool } = pkg;
 
 // ---------- ENV ----------
@@ -15,6 +17,25 @@ const CRON_SECRET = process.env.CRON_SECRET || "";
 // Allow your Netlify site (adjust as needed)
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://charming-dieffenbachia-a9e8f1.netlify.app";
 
+// ---------- Telegram constants & helper ----------
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || FRONTEND_ORIGIN; // fallback
+
+async function tgApi(method, payload) {
+  if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(`Telegram API error: ${JSON.stringify(json)}`);
+  return json.result;
+}
+
+
 // ---------- DB ----------
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -23,17 +44,93 @@ const pool = new Pool({
 
 // ---------- APP ----------
 const app = express();
+// ------ Telegram Mini App auth verification ------
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+
+function parseInitData(initDataStr = "") {
+  const params = new URLSearchParams(initDataStr);
+  const obj = {};
+  for (const [k, v] of params.entries()) obj[k] = v;
+  // Telegram sends `user` as a JSON string if present
+  if (obj.user) {
+    try { obj.user = JSON.parse(obj.user); } catch {}
+  }
+  return obj;
+}
+
+function verifyTelegramInitData(initDataStr = "") {
+  if (!BOT_TOKEN || !initDataStr) return null;
+  const data = parseInitData(initDataStr);
+
+  const { hash, ...rest } = data;
+  if (!hash) return null;
+
+  // Build data-check string
+  const entries = Object.entries(rest).sort(([a],[b]) => a.localeCompare(b));
+  const dataCheckString = entries.map(([k,v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join("\n");
+
+  // secret = SHA256(BOT_TOKEN)
+  const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
+  const hmac = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+
+  if (hmac !== hash) return null;
+
+  // Optional freshness: 24h
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (rest.auth_date && nowSec - Number(rest.auth_date) > 86400) return null;
+
+  return { user: rest.user || null, raw: rest };
+}
+
+function telegramAuth(req, _res, next) {
+  const initData = req.header("X-Telegram-InitData") || "";
+  const verified = verifyTelegramInitData(initData);
+  req.tgUser = verified?.user || null; // {id, username, first_name, ...}
+  next();
+}
+
+
+
 app.use(express.json({ limit: "1mb" }));
+
+// Telegram webhook endpoint
+app.post("/telegram/webhook", async (req, res) => {
+  console.log("Telegram update:", req.body);
+
+  const update = req.body || {};
+  const msg = update.message || update.edited_message;
+
+  if (msg?.text?.startsWith("/start")) {
+    const chat_id = msg.chat.id;
+    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id,
+        text: "🚀 Meme Draft is ready. Tap to play:",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🚀 Play Meme Draft", web_app: { url: process.env.FRONTEND_URL } }
+          ]]
+        }
+      })
+    });
+  }
+
+  res.json({ ok: true }); // must always reply 200
+});
+
 
 // --- CORS ---
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-cron-secret"]
+    allowedHeaders: ["Content-Type", "x-cron-secret", "X-Telegram-InitData", "x-telegram-initdata"]
   })
 );
 app.options("*", cors());
+
 
 // ---------- Allowlist of token addresses you want to track ----------
 const TOKEN_ALLOWLIST = [
@@ -272,16 +369,21 @@ app.get("/tokens/:address/history", async (req, res) => {
 });
 
 // ---------- WRITE: submit a play ----------
-app.post("/plays", async (req, res) => {
+app.post("/plays", telegramAuth, async (req, res) => {
   try {
-    const { player, selections } = req.body || {};
-    if (!player || !Array.isArray(selections) || selections.length === 0) {
-      return res.status(400).json({ ok: false, error: "player and selections required" });
+    // Require TG user in production; allow fallback locally if you want
+    if (!req.tgUser) {
+      return res.status(401).json({ ok: false, error: "unauthorized (Telegram initData missing/invalid)" });
     }
-    // sanitize
-    const name = String(player).slice(0, 32);
+
+    const { selections } = req.body || {};
+    if (!Array.isArray(selections) || selections.length === 0) {
+      return res.status(400).json({ ok: false, error: "selections required" });
+    }
+
+    // sanitize selections
     const safeSelections = selections
-      .slice(0, 10) // safety cap
+      .slice(0, 10)
       .map(s => ({
         address: String(s.address || ""),
         symbol: String(s.symbol || ""),
@@ -293,19 +395,27 @@ app.post("/plays", async (req, res) => {
     const longs = safeSelections.filter(s => s.direction === "long").length;
     const shorts = safeSelections.filter(s => s.direction === "short").length;
 
-    // UTC round date (reset at 00:00 UTC)
+    // identity from Telegram
+    const tgId = String(req.tgUser.id);
+    const player =
+      req.tgUser.username ? `@${req.tgUser.username}` :
+      (req.tgUser.first_name || "anon");
+
+    // UTC round date
     const round_date = new Date().toISOString().slice(0, 10);
 
-    const q = `insert into plays(player, round_date, selections, longs, shorts, pnl, created_at)
-               values ($1, $2, $3, $4, $5, 0, now())
+    const q = `insert into plays(telegram_id, player, round_date, selections, longs, shorts, pnl, created_at)
+               values ($1,$2,$3,$4,$5,$6,0,now())
                returning id`;
-    const { rows } = await pool.query(q, [name, round_date, JSON.stringify(safeSelections), longs, shorts]);
-    res.json({ ok: true, id: rows[0].id, round_date, longs, shorts });
+    const { rows } = await pool.query(q, [tgId, player, round_date, JSON.stringify(safeSelections), longs, shorts]);
+
+    res.json({ ok: true, id: rows[0].id, round_date, longs, shorts, player, telegram_id: tgId });
   } catch (e) {
     console.error("Error inserting play:", e);
     res.status(500).json({ ok: false, error: "Failed to save play" });
   }
 });
+
 
 // ---------- READ: leaderboard (yesterday UTC by default) ----------
 app.get("/leaderboard", async (req, res) => {
@@ -332,6 +442,41 @@ app.get("/leaderboard", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch leaderboard" });
   }
 });
+
+// ---------- Telegram Webhook ----------
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    // Verify Telegram's secret token (set when you call setWebhook)
+    const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
+    if (TELEGRAM_WEBHOOK_SECRET && hdr !== TELEGRAM_WEBHOOK_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const update = req.body || {};
+    const msg = update.message || update.edited_message || null;
+
+    // Handle /start
+    if (msg?.text?.startsWith("/start")) {
+      const chat_id = msg.chat.id;
+      await tgApi("sendMessage", {
+        chat_id,
+        text: "🚀 Meme Draft is ready. Tap to play:",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
+          ]]
+        }
+      });
+    }
+
+    // No-op for other updates
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("telegram/webhook error:", e);
+    res.status(200).json({ ok: true }); // don't make Telegram retry forever
+  }
+});
+
 
 // ---------- Health ----------
 app.get("/health", async (_req, res) => {
