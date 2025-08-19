@@ -44,78 +44,78 @@ const pool = new Pool({
 
 // ---------- APP ----------
 const app = express();
-// ------ Telegram Mini App auth verification (fixed) ------
-// Function to verify Telegram initData
-// Function to verify Telegram initData
+// Verifies Telegram WebApp initData using the bot token.
+// Returns the parsed Telegram user object on success, or null on failure.
 function verifyTelegramInitData(initData, botToken) {
-  if (!initData || !botToken) {
+  try {
+    if (!initData || !botToken) return null;
+
+    // Split the raw query string without decoding values
+    const pairs = initData.split("&").filter(Boolean);
+
+    // Extract the provided hash (must exist)
+    const hashPair = pairs.find(p => p.startsWith("hash="));
+    if (!hashPair) return null;
+    const receivedHash = decodeURIComponent(hashPair.split("=").slice(1).join("="));
+
+    // Exclude hash and signature when building the data_check_string
+    const filtered = pairs.filter(
+      p => !p.startsWith("hash=") && !p.startsWith("signature=")
+    );
+
+    // Sort by key (compare decoded keys) but keep raw "k=v" text
+    filtered.sort((a, b) => {
+      const ka = decodeURIComponent(a.split("=")[0]);
+      const kb = decodeURIComponent(b.split("=")[0]);
+      return ka.localeCompare(kb);
+    });
+
+    // data_check_string is the raw pairs joined by '\n'
+    const dataCheckString = filtered.join("\n");
+
+    // Compute HMAC per Telegram spec: HMAC_SHA256(secret, data_check_string)
+    // where secret = HMAC_SHA256("WebAppData", botToken)
+    const secret = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+    const computed = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+
+    if (computed !== receivedHash) return null;
+
+    // Parse and return the user object
+    const userPair = filtered.find(p => p.startsWith("user="));
+    if (!userPair) return null;
+    const userJson = decodeURIComponent(userPair.split("=").slice(1).join("="));
+    const user = JSON.parse(userJson);
+
+    return user;
+  } catch (_err) {
     return null;
   }
-
-  // Find the hash and remove it from the data string
-  const urlParams = new URLSearchParams(initData);
-  
-  // Explicitly get the hash parameter
-  const receivedHash = urlParams.get('hash');
-  
-  // Make sure to remove both hash and signature before computing the check string
-  urlParams.delete('hash');
-  urlParams.delete('signature');
-
-  // Create a sorted array of key=value pairs, excluding hash and signature
-  const dataCheckString = Array.from(urlParams.entries())
-    .sort(([keyA], [keyB]) => keyA.localeCompare(keyB))
-    .map(([key, value]) => `${key}=${value}`)
-    .join('\n');
-
-  // Log the data to see what is being used for hashing
-  console.log("--- Telegram InitData Verification Log ---");
-  console.log("Data check string:", dataCheckString);
-  console.log("Received hash:", receivedHash);
-
-  // Compute the SHA256 hash
-  const secret = crypto.createHmac('sha256', 'WebAppData')
-    .update(botToken)
-    .digest();
-  const computed = crypto.createHmac('sha256', secret)
-    .update(dataCheckString)
-    .digest('hex');
-
-  console.log("Computed hash:", computed);
-  console.log("------------------------------------------");
-
-  // Compare the hashes
-  if (computed !== receivedHash) {
-    return null; // Hashes do not match, validation failed
-  }
-
-  // Extract the user data from the verified string
-  const user = urlParams.get('user');
-  if (user) {
-    return JSON.parse(user);
-  }
-
-  return null;
 }
 
+
+// Middleware to extract and verify Telegram user from headers
 function telegramAuth(req, _res, next) {
   const initData =
     req.get("X-Telegram-InitData") ||
-    req.headers["x-telegram-initdata"] || // case-variant
-    ""; // (optional) could also read from query if you ever pass tgWebAppData there
+    req.headers["x-telegram-initdata"] ||
+    "";
 
-  // Debug (optional):
-  // console.log("HEADER X-Telegram-InitData (len):", initData?.length || 0);
+  // Call verifier with the bot token
+  const user = verifyTelegramInitData(initData, BOT_TOKEN);
 
-  const verified = verifyTelegramInitData(initData);
-  req.tgUser = verified?.user || null; // { id, username, first_name, ... }
+  // Attach the parsed user (or null) to the request
+  req.tgUser = user || null;
+
   next();
 }
 
 
 
 
+
 app.use(express.json({ limit: "1mb" }));
+app.use(telegramAuth);
+
 
 // Telegram webhook endpoint
 app.post("/telegram/webhook", async (req, res) => {
