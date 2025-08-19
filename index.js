@@ -101,7 +101,7 @@ app.post("/telegram/webhook", async (req, res) => {
 
   if (msg?.text?.startsWith("/start")) {
     const chat_id = msg.chat.id;
-    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -109,7 +109,7 @@ app.post("/telegram/webhook", async (req, res) => {
         text: "🚀 Meme Draft is ready. Tap to play:",
         reply_markup: {
           inline_keyboard: [[
-            { text: "🚀 Play Meme Draft", web_app: { url: process.env.FRONTEND_URL } }
+            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
           ]]
         }
       })
@@ -118,6 +118,7 @@ app.post("/telegram/webhook", async (req, res) => {
 
   res.json({ ok: true }); // must always reply 200
 });
+
 
 
 // --- CORS ---
