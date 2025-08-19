@@ -45,7 +45,6 @@ const pool = new Pool({
 // ---------- APP ----------
 const app = express();
 // ------ Telegram Mini App auth verification ------
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
 function parseInitData(initDataStr = "") {
   const params = new URLSearchParams(initDataStr);
