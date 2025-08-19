@@ -46,62 +46,67 @@ const pool = new Pool({
 const app = express();
 // Verifies Telegram WebApp initData using the bot token.
 // Returns the parsed Telegram user object on success, or null on failure.
+// Verifies Telegram WebApp initData using the bot token.
+// Returns the parsed Telegram user object on success, or null on failure.
 function verifyTelegramInitData(initData, botToken) {
   try {
     if (!initData || !botToken) return null;
 
-    // Split the raw query string without decoding values
+    // 1. Split into raw pairs, don't decode yet
     const pairs = initData.split("&").filter(Boolean);
 
-    // Extract the provided hash (must exist)
+    // 2. Extract and remove hash
     const hashPair = pairs.find(p => p.startsWith("hash="));
     if (!hashPair) return null;
     const receivedHash = decodeURIComponent(hashPair.split("=").slice(1).join("="));
 
-    // Exclude hash and signature when building the data_check_string
-    const filtered = pairs.filter(
-      p => !p.startsWith("hash=") && !p.startsWith("signature=")
-    );
+    const filtered = pairs.filter(p => !p.startsWith("hash=") && !p.startsWith("signature="));
 
-    // Sort by key (compare decoded keys) but keep raw "k=v" text
+    // 3. Sort by decoded key, but keep raw "k=v"
     filtered.sort((a, b) => {
       const ka = decodeURIComponent(a.split("=")[0]);
       const kb = decodeURIComponent(b.split("=")[0]);
       return ka.localeCompare(kb);
     });
 
-    // data_check_string is the raw pairs joined by '\n'
+    // 4. Join with \n (exact raw values)
     const dataCheckString = filtered.join("\n");
 
-    // Compute HMAC per Telegram spec: HMAC_SHA256(secret, data_check_string)
-    // where secret = HMAC_SHA256("WebAppData", botToken)
+    // 5. Compute HMAC
     const secret = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
-    const computed = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+    const computedHash = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
 
-    if (computed !== receivedHash) return null;
+    if (computedHash !== receivedHash) {
+      console.error("Hash validation failed.");
+      console.log("Received Hash:", receivedHash);
+      console.log("Computed Hash:", computedHash);
+      console.log("Data Check String:", dataCheckString);
+      return null;
+    }
 
-    // Parse and return the user object
+    // 6. Parse user
     const userPair = filtered.find(p => p.startsWith("user="));
     if (!userPair) return null;
     const userJson = decodeURIComponent(userPair.split("=").slice(1).join("="));
-    const user = JSON.parse(userJson);
+    return JSON.parse(userJson);
 
-    return user;
-  } catch (_err) {
+  } catch (err) {
+    console.error("Error in verifyTelegramInitData:", err);
     return null;
   }
 }
 
 
+
 // Middleware to extract and verify Telegram user from headers
 function telegramAuth(req, _res, next) {
-  // 1) Prefer custom header used by your client
+  // Prefer the custom header you’re sending from the WebApp
   let initData =
     req.get("X-Telegram-InitData") ||
     req.headers["x-telegram-initdata"] ||
     "";
 
-  // 2) Fallback: support Authorization: tma <initDataRaw> (per TG docs)
+  // Fallback: support Authorization: tma <initDataRaw> (per TG docs)
   if (!initData) {
     const auth = req.get("authorization") || req.get("Authorization") || "";
     if (auth.startsWith("tma ")) {
@@ -109,7 +114,7 @@ function telegramAuth(req, _res, next) {
     }
   }
 
-  // 3) Verify with your bot token, and assign the parsed user object directly
+  // IMPORTANT: pass BOT_TOKEN and assign the returned user object directly
   const user = verifyTelegramInitData(initData, BOT_TOKEN);
   req.tgUser = user || null;
 
@@ -118,6 +123,8 @@ function telegramAuth(req, _res, next) {
 
   next();
 }
+
+
 
 
 
