@@ -95,19 +95,30 @@ function verifyTelegramInitData(initData, botToken) {
 
 // Middleware to extract and verify Telegram user from headers
 function telegramAuth(req, _res, next) {
-  const initData =
+  // 1) Prefer custom header used by your client
+  let initData =
     req.get("X-Telegram-InitData") ||
     req.headers["x-telegram-initdata"] ||
     "";
 
-  // Call verifier with the bot token
-  const user = verifyTelegramInitData(initData, BOT_TOKEN);
+  // 2) Fallback: support Authorization: tma <initDataRaw> (per TG docs)
+  if (!initData) {
+    const auth = req.get("authorization") || req.get("Authorization") || "";
+    if (auth.startsWith("tma ")) {
+      initData = auth.slice(4);
+    }
+  }
 
-  // Attach the parsed user (or null) to the request
+  // 3) Verify with your bot token, and assign the parsed user object directly
+  const user = verifyTelegramInitData(initData, BOT_TOKEN);
   req.tgUser = user || null;
+
+  // Optional debug
+  console.log("[telegramAuth] hasInitData:", Boolean(initData), "user:", req.tgUser);
 
   next();
 }
+
 
 
 
