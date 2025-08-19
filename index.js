@@ -48,6 +48,8 @@ const app = express();
 // Returns the parsed Telegram user object on success, or null on failure.
 // Verifies Telegram WebApp initData using the bot token.
 // Returns the parsed Telegram user object on success, or null on failure.
+// Verifies Telegram WebApp initData using the bot token.
+// Returns the parsed Telegram user object on success, or null on failure.
 function verifyTelegramInitData(initData, botToken) {
   try {
     if (!initData || !botToken) return null;
@@ -72,9 +74,14 @@ function verifyTelegramInitData(initData, botToken) {
     // 4. Join with \n (exact raw values)
     const dataCheckString = filtered.join("\n");
 
-    // 5. Compute HMAC
-    const secret = crypto.createHmac("sha256", botToken).update("WebAppData").digest();
-    const computedHash = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+    // 5. Compute HMAC with correct order
+    const secret = crypto.createHmac("sha256", "WebAppData")
+      .update(botToken)
+      .digest();
+
+    const computedHash = crypto.createHmac("sha256", secret)
+      .update(dataCheckString)
+      .digest("hex");
 
     if (computedHash !== receivedHash) {
       console.error("Hash validation failed.");
@@ -95,6 +102,7 @@ function verifyTelegramInitData(initData, botToken) {
     return null;
   }
 }
+
 
 
 
