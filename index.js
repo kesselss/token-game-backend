@@ -44,49 +44,55 @@ const pool = new Pool({
 
 // ---------- APP ----------
 const app = express();
-// ------ Telegram Mini App auth verification ------
-
-function parseInitData(initDataStr = "") {
-  const params = new URLSearchParams(initDataStr);
-  const obj = {};
-  for (const [k, v] of params.entries()) obj[k] = v;
-  // Telegram sends `user` as a JSON string if present
-  if (obj.user) {
-    try { obj.user = JSON.parse(obj.user); } catch {}
-  }
-  return obj;
-}
-
+// ------ Telegram Mini App auth verification (fixed) ------
 function verifyTelegramInitData(initDataStr = "") {
   if (!BOT_TOKEN || !initDataStr) return null;
-  const data = parseInitData(initDataStr);
 
-  const { hash, ...rest } = data;
-  if (!hash) return null;
+  // Build params from the raw initData string
+  const params = new URLSearchParams(initDataStr);
 
-  // Build data-check string
-  const entries = Object.entries(rest).sort(([a],[b]) => a.localeCompare(b));
-  const dataCheckString = entries.map(([k,v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join("\n");
+  const receivedHash = params.get("hash");
+  if (!receivedHash) return null;
 
-  // secret = SHA256(BOT_TOKEN)
+  // hash is excluded from the data-check string
+  params.delete("hash");
+
+  // EXACT key=value pairs (no JSON stringify), sorted by key, joined with '\n'
+  const entries = Array.from(params.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join("\n");
+
   const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
-  const hmac = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+  const computed = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+  if (computed !== receivedHash) return null;
 
-  if (hmac !== hash) return null;
+  // Freshness (24h)
+  const authDate = Number(params.get("auth_date") || 0);
+  if (authDate && (Math.floor(Date.now() / 1000) - authDate > 86400)) return null;
 
-  // Optional freshness: 24h
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (rest.auth_date && nowSec - Number(rest.auth_date) > 86400) return null;
+  // Parse user ONLY AFTER verification
+  let user = null;
+  const userStr = params.get("user");
+  if (userStr) {
+    try { user = JSON.parse(userStr); } catch {}
+  }
 
-  return { user: rest.user || null, raw: rest };
+  return { user, raw: Object.fromEntries(params.entries()) };
 }
 
 function telegramAuth(req, _res, next) {
-  const initData = req.header("X-Telegram-InitData") || "";
+  const initData =
+    req.get("X-Telegram-InitData") ||
+    req.headers["x-telegram-initdata"] || // case-variant
+    ""; // (optional) could also read from query if you ever pass tgWebAppData there
+
+  // Debug (optional):
+  // console.log("HEADER X-Telegram-InitData (len):", initData?.length || 0);
+
   const verified = verifyTelegramInitData(initData);
-  req.tgUser = verified?.user || null; // {id, username, first_name, ...}
+  req.tgUser = verified?.user || null; // { id, username, first_name, ... }
   next();
 }
+
 
 
 
