@@ -45,38 +45,51 @@ const pool = new Pool({
 // ---------- APP ----------
 const app = express();
 // ------ Telegram Mini App auth verification (fixed) ------
-function verifyTelegramInitData(initDataStr = "") {
-  if (!BOT_TOKEN || !initDataStr) return null;
-
-  // Build params from the raw initData string
-  const params = new URLSearchParams(initDataStr);
-
-  const receivedHash = params.get("hash");
-  if (!receivedHash) return null;
-
-  // hash is excluded from the data-check string
-  params.delete("hash");
-
-  // EXACT key=value pairs (no JSON stringify), sorted by key, joined with '\n'
-  const entries = Array.from(params.entries()).sort(([a], [b]) => a.localeCompare(b));
-  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join("\n");
-
-  const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
-  const computed = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
-  if (computed !== receivedHash) return null;
-
-  // Freshness (24h)
-  const authDate = Number(params.get("auth_date") || 0);
-  if (authDate && (Math.floor(Date.now() / 1000) - authDate > 86400)) return null;
-
-  // Parse user ONLY AFTER verification
-  let user = null;
-  const userStr = params.get("user");
-  if (userStr) {
-    try { user = JSON.parse(userStr); } catch {}
+// Function to verify Telegram initData
+function verifyTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) {
+    return null;
   }
 
-  return { user, raw: Object.fromEntries(params.entries()) };
+  // Find the hash and remove it from the data string
+  const urlParams = new URLSearchParams(initData);
+  const receivedHash = urlParams.get('hash');
+  urlParams.delete('hash');
+
+  // Create a sorted array of key=value pairs, excluding hash
+  const dataCheckString = Array.from(urlParams.entries())
+    .sort(([keyA], [keyB]) => keyA.localeCompare(keyB))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n');
+
+  // Log the data to see what is being used for hashing
+  console.log("--- Telegram InitData Verification Log ---");
+  console.log("Data check string:", dataCheckString);
+  console.log("Received hash:", receivedHash);
+
+  // Compute the SHA256 hash
+  const secret = crypto.createHmac('sha256', 'WebAppData')
+    .update(botToken)
+    .digest();
+  const computed = crypto.createHmac('sha256', secret)
+    .update(dataCheckString)
+    .digest('hex');
+
+  console.log("Computed hash:", computed);
+  console.log("------------------------------------------");
+
+  // Compare the hashes
+  if (computed !== receivedHash) {
+    return null; // Hashes do not match, validation failed
+  }
+
+  // Extract the user data from the verified string
+  const user = urlParams.get('user');
+  if (user) {
+    return JSON.parse(user);
+  }
+
+  return null;
 }
 
 function telegramAuth(req, _res, next) {
@@ -375,51 +388,45 @@ app.get("/tokens/:address/history", async (req, res) => {
 });
 
 // ---------- WRITE: submit a play (with debug logs) ----------
-app.post("/plays", telegramAuth, async (req, res) => {
+// ------ Save a play (user's selections) ----------
+app.post("/plays", async (req, res) => {
   try {
-    console.log("[/plays] body:", req.body);
-    console.log("[/plays] tgUser:", req.tgUser);
+    const { selections } = req.body;
+    
+    // Log the incoming headers to debug the initData
+    console.log("--- /plays Request Log ---");
+    console.log("Received X-Telegram-InitData:", req.get('X-Telegram-InitData'));
+    console.log("Received X-Telegram-InitDataUnsafe:", req.get('X-Telegram-InitDataUnsafe'));
+    console.log("Backend-parsed Telegram user (should not be null):", req.tgUser);
+    console.log("----------------------------------");
 
     if (!req.tgUser) {
-      return res.status(401).json({ ok: false, error: "unauthorized: missing/invalid Telegram initData" });
+      return res.status(401).json({ ok: false, error: "Unauthorized: Telegram user not found in request" });
     }
 
-    const { selections } = req.body || {};
-    if (!Array.isArray(selections) || selections.length === 0) {
-      return res.status(400).json({ ok: false, error: "selections required (non-empty array)" });
+    if (!selections || !Array.isArray(selections)) {
+      return res.status(400).json({ ok: false, error: "Invalid selections data" });
     }
 
-    const safeSelections = selections.slice(0, 10).map(s => ({
-      address: String(s.address || ""),
-      symbol: String(s.symbol || ""),
-      name: String(s.name || ""),
-      logoURI: String(s.logoURI || ""),
-      direction: s.direction === "short" ? "short" : "long"
-    }));
+    // Prepare data for the database
+    const playId = crypto.randomUUID();
+    const userId = req.tgUser.id.toString();
+    const username = req.tgUser.username || req.tgUser.first_name || `user-${userId}`;
+    const timestamp = new Date();
 
-    const longs = safeSelections.filter(s => s.direction === "long").length;
-    const shorts = safeSelections.filter(s => s.direction === "short").length;
+    // Store the play in the database
+    await pool.query(
+      "INSERT INTO plays (id, user_id, username, timestamp, selections) VALUES ($1, $2, $3, $4, $5)",
+      [playId, userId, username, timestamp, JSON.stringify(selections)]
+    );
 
-    const tgId = String(req.tgUser.id);
-    const player = req.tgUser.username ? `@${req.tgUser.username}` : (req.tgUser.first_name || "anon");
-    const round_date = new Date().toISOString().slice(0, 10);
-
-    const q = `
-      insert into plays(telegram_id, player, round_date, selections, longs, shorts, pnl, created_at)
-      values ($1,$2,$3,$4,$5,$6,0,now())
-      returning id
-    `;
-    const params = [tgId, player, round_date, JSON.stringify(safeSelections), longs, shorts];
-
-    const { rows } = await pool.query(q, params);
-    console.log("[/plays] insert ok id=", rows[0]?.id);
-
-    res.json({ ok: true, id: rows[0].id, round_date, longs, shorts, player, telegram_id: tgId });
+    res.json({ ok: true, message: "Play saved successfully", playId });
   } catch (e) {
-    console.error("[/plays] error:", e);
-    res.status(500).json({ ok: false, error: e.message || "Failed to save play" });
+    console.error("/plays error:", e);
+    res.status(500).json({ ok: false, error: "Internal Server Error" });
   }
 });
+
 
 
 
