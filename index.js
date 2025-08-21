@@ -128,6 +128,40 @@ req.tgUser = user || null;
 app.use(express.json({ limit: "1mb" }));
 app.use(telegramAuth);
 
+// ---------- READ: current active round ----------
+app.get("/rounds/current", async (_req, res) => {
+  try {
+    const now = new Date().toISOString();
+
+    // 1. Look up the active round (where now is between start and end)
+    const { rows } = await pool.query(
+      `select *
+       from rounds
+       where round_start <= $1 and round_end > $1
+       order by round_start desc
+       limit 1`,
+      [now]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "No active round right now." });
+    }
+
+    const round = rows[0];
+
+    res.json({
+      id: round.id,
+      round_start: round.round_start,
+      round_end: round.round_end,
+      tokens: round.tokens
+    });
+  } catch (e) {
+    console.error("Error fetching current round:", e);
+    res.status(500).json({ error: "Failed to fetch current round" });
+  }
+});
+
+
 
 // Telegram webhook endpoint
 app.post("/telegram/webhook", async (req, res) => {
