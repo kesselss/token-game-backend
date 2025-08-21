@@ -293,8 +293,8 @@ async function insertHistoryRows(address, rows) {
   await pool.query(q, params);
 }
 
-// ---------- CRON: pull daily token list + cache snapshots ----------
-app.post("/cron/pull", async (req, res) => {
+// ---------- CRON: fetch & save daily token list ----------
+app.post("/cron/fetch-daily-list", async (req, res) => {
   try {
     if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
@@ -305,14 +305,13 @@ app.post("/cron/pull", async (req, res) => {
 
     const today = new Date().toISOString().slice(0, 10);
 
-    // 1. Fetch today’s top 20 meme tokens by 24h volume
+    // Fetch today’s top 20 meme tokens by 24h volume
     const topTokens = await fetchTopMemeTokens(20, 10000);
-
     if (!Array.isArray(topTokens) || !topTokens.length) {
       return res.status(500).json({ ok: false, error: "No tokens returned from Birdeye" });
     }
 
-    // 2. Save list into daily_token_lists (one per day)
+    // Save into daily_token_lists
     await pool.query(
       `insert into daily_token_lists (round_date, tokens)
        values ($1, $2)
@@ -320,9 +319,37 @@ app.post("/cron/pull", async (req, res) => {
       [today, JSON.stringify(topTokens)]
     );
 
-    // 3. Fetch + cache snapshots/history for each token
+    res.json({ ok: true, saved: topTokens.length });
+  } catch (e) {
+    console.error("Cron fetch-daily-list failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------- CRON: fetch token snapshots + history ----------
+app.post("/cron/fetch-tokens", async (req, res) => {
+  try {
+    if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    if (!BIRDEYE_API_KEY) {
+      return res.status(500).json({ ok: false, error: "missing BIRDEYE_API_KEY" });
+    }
+
+    // Load today's token list
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows } = await pool.query(
+      `select tokens from daily_token_lists where round_date = $1 limit 1`,
+      [today]
+    );
+    if (!rows.length) {
+      return res.status(400).json({ ok: false, error: "No daily token list found. Run /cron/fetch-daily-list first." });
+    }
+
+    const tokenList = rows[0].tokens;
     let pulled = 0;
-    for (const t of topTokens) {
+
+    for (const t of tokenList) {
       try {
         const snap = await fetchTokenSnapshot(t.address);
         await upsertTokenSnapshot(snap);
@@ -332,17 +359,18 @@ app.post("/cron/pull", async (req, res) => {
 
         pulled++;
       } catch (e) {
-        console.error("pull error for", t.address, e.message);
+        console.error("fetch-tokens error for", t.address, e.message);
       }
-      await new Promise((r) => setTimeout(r, 120)); // small pacing
+      await new Promise((r) => setTimeout(r, 120)); // pacing
     }
 
-    res.json({ ok: true, saved: topTokens.length, pulled });
+    res.json({ ok: true, pulled, total: tokenList.length });
   } catch (e) {
-    console.error("Cron pull failed:", e);
+    console.error("Cron fetch-tokens failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 // ---------- Build leaderboard for a finished round ----------
 async function buildLeaderboard(roundId) {
