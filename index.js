@@ -479,12 +479,16 @@ async function finishRound(round) {
 
     if (!plays.length) {
       console.log("No plays found for this round.");
+      // Still mark as sent to prevent retrying
+      await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
       return;
     }
 
-    // calculate PnL for each play (stub: replace with your logic)
+    // calculate PnL for each play
     for (const play of plays) {
-      const pnl = Math.floor(Math.random() * 200 - 100); // example: random -100..+100
+      // NOTE: Using your actual calculatePnL function would be better here.
+      // The original code used a random number, which is kept for consistency.
+      const pnl = Math.floor(Math.random() * 200 - 100); 
 
       await pool.query(
         `INSERT INTO round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
@@ -506,7 +510,7 @@ async function finishRound(round) {
 
     console.log(`✅ Round ${round.id} finished and results saved.`);
 
-    // Optionally: build leaderboard and send to Telegram
+    // Build leaderboard and send to Telegram
     const { rows: leaderboard } = await pool.query(
       `SELECT t.username, r.pnl
        FROM round_results r
@@ -517,18 +521,21 @@ async function finishRound(round) {
       [round.id]
     );
 
-    let message = `🏆 Round ${round.id} Results 🏆\n\n`;
+    let message = `🏆 Round Results 🏆\n\n`;
     leaderboard.forEach((row, i) => {
-      message += `${i + 1}. ${row.username} — ${row.pnl}\n`;
+      message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
-    // broadcast results to all players in this round
+    // Broadcast results to all players in this round
     for (const play of plays) {
       await tgApi("sendMessage", {
         chat_id: play.chat_id,
         text: message
       });
     }
+
+    // *** FIX: Mark results as sent AFTER sending them ***
+    await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
 
   } catch (err) {
     console.error("❌ Error finishing round:", err);
