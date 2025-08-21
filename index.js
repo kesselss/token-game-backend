@@ -445,7 +445,7 @@ app.post("/cron/round-results", async (req, res) => {
 // ---------- Telegram Webhook ----------
 app.post("/telegram/webhook", async (req, res) => {
   try {
-    // Verify Telegram's secret token (set when you call setWebhook)
+    // Verify Telegram's secret token (set when you called setWebhook)
     const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
     if (TELEGRAM_WEBHOOK_SECRET && hdr !== TELEGRAM_WEBHOOK_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
@@ -453,20 +453,22 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const update = req.body || {};
     const msg = update.message || update.edited_message || null;
-    if (!msg) {
-      return res.json({ ok: true });
+
+    if (msg) {
+      const chat_id = msg.chat.id;
+
+      // --- Always save/update user in DB ---
+      await pool.query(
+        `insert into telegram_users (chat_id, first_seen, last_seen)
+         values ($1, now(), now())
+         on conflict (chat_id) do update set last_seen = now()`,
+        [chat_id]
+      );
+
+      console.log("Incoming chat saved:", chat_id);
     }
 
-    // --- Minimal user tracking ---
-    await pool.query(
-      `insert into telegram_users (chat_id, first_seen, last_seen)
-       values ($1, now(), now())
-       on conflict (chat_id) do update
-         set last_seen = now()`,
-      [msg.chat.id]
-    );
-
-    // ---------- Handle /start ----------
+    // Handle /start
     if (msg?.text?.startsWith("/start")) {
       const chat_id = msg.chat.id;
       await tgApi("sendMessage", {
@@ -480,7 +482,7 @@ app.post("/telegram/webhook", async (req, res) => {
       });
     }
 
-    // ---------- Handle /timer ----------
+    // Handle /timer
     if (msg?.text?.startsWith("/timer")) {
       const chat_id = msg.chat.id;
 
@@ -504,10 +506,11 @@ app.post("/telegram/webhook", async (req, res) => {
       }
     }
 
-    res.json({ ok: true }); // Always reply to Telegram
+    // Acknowledge update
+    res.json({ ok: true });
   } catch (e) {
     console.error("telegram/webhook error:", e);
-    res.status(200).json({ ok: true }); // prevent Telegram retry loop
+    res.status(200).json({ ok: true }); // don't retry forever
   }
 });
 
