@@ -460,29 +460,38 @@ async function startNewRound() {
 
   return inserted[0];
 }
+
+
+// ---------- Finish Round ----------
 async function finishRound(round) {
   // Fetch all plays for this round
   const { rows: plays } = await pool.query(
-    `select p.id, p.user_id, p.selections, u.username
+    `select p.id, p.user_id, p.username, p.selections, t.chat_id
      from plays p
-     join users u on u.id = p.user_id
-     where p.round_id = $1`,
-    [round.id]
+     join telegram_users t on t.user_id::text = p.user_id::text
+     where p.timestamp between $1 and $2`,
+    [round.round_start, round.round_end]
   );
 
-for (const play of plays) {
-  const selections = play.selections;
-  const pnl = await calculatePnL(selections, round);
+  for (const play of plays) {
+    // Compute PnL from selections vs token history
+    const pnl = await calculatePnL(play.selections, round);
 
-  await pool.query(
-    `insert into round_results (round_id, user_id, selections, pnl)
-     values ($1, $2, $3, $4)
-     on conflict (round_id, user_id) do update
-     set selections = excluded.selections, pnl = excluded.pnl`,
-    [round.id, play.user_id, JSON.stringify(selections), pnl]
-  );
-}
-
+    // Save into round_results (chat_id-based schema)
+    await pool.query(
+      `insert into round_results (round_id, chat_id, portfolio, pnl, choices)
+       values ($1, $2, $3, $4, $5)
+       on conflict (round_id, chat_id) do update
+       set portfolio = excluded.portfolio, pnl = excluded.pnl, choices = excluded.choices`,
+      [
+        round.id,
+        play.chat_id,
+        JSON.stringify(play.selections),
+        pnl,
+        JSON.stringify(play.selections)
+      ]
+    );
+  }
 
   // Build leaderboard text
   const leaderboard = await buildLeaderboard(round.id);
@@ -500,31 +509,37 @@ for (const play of plays) {
     }
   }
 
+  // Mark results sent
   await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
 }
 
 
 
-// ---------- Build leaderboard for a finished round ----------
+
+// ---------- Build Leaderboard ----------
 async function buildLeaderboard(roundId) {
   const { rows } = await pool.query(
-    `select u.username, r.pnl
+    `select t.username, r.pnl
      from round_results r
-     join users u on u.id = r.user_id
+     join telegram_users t on t.chat_id = r.chat_id
      where r.round_id = $1
      order by r.pnl desc
      limit 10`,
     [roundId]
   );
 
-  if (!rows.length) return "No results yet.";
+  if (!rows.length) {
+    return "No results yet.";
+  }
 
   let text = "🏆 Leaderboard\n\n";
   rows.forEach((row, i) => {
-    text += `${i + 1}. ${row.username || "Anon"} — ${row.pnl.toFixed(2)}%\n`;
+    text += `${i + 1}. ${row.username || "Anon"} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
   });
+
   return text;
 }
+
 
 
 
@@ -811,6 +826,8 @@ app.post("/plays", async (req, res) => {
 
 // ---------- READ: leaderboard (24h cycle, ranked by PnL) ----------
 // ---------- Leaderboard ----------
+// ---------- Leaderboard ----------
+// ---------- Leaderboard API ----------
 app.get("/leaderboard", async (req, res) => {
   try {
     // Find the most recent finished round
@@ -821,28 +838,39 @@ app.get("/leaderboard", async (req, res) => {
        order by round_end desc
        limit 1`
     );
+
     if (!rounds.length) {
       return res.json({ ok: true, leaderboard: [] });
     }
+
     const roundId = rounds[0].id;
 
-    // Fetch leaderboard from round_results
+    // Reuse buildLeaderboard()
+    const leaderboardText = await buildLeaderboard(roundId);
+
+    // Also return structured data for frontend
     const { rows } = await pool.query(
-      `select u.username, r.pnl
+      `select t.username, r.pnl
        from round_results r
-       join users u on u.id = r.user_id
+       join telegram_users t on t.chat_id = r.chat_id
        where r.round_id = $1
        order by r.pnl desc
        limit 10`,
       [roundId]
     );
 
-    res.json({ ok: true, leaderboard: rows });
+    res.json({
+      ok: true,
+      leaderboard: rows,
+      text: leaderboardText
+    });
   } catch (e) {
     console.error("leaderboard error", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+
 
 
 
