@@ -730,40 +730,6 @@ app.get("/leaderboard", async (_req, res) => {
 
 
 
-// Handle /timer
-if (msg?.text?.startsWith("/timer")) {
-  const chat_id = msg.chat.id;
-
-  const round = await getCurrentRound();
-  if (!round) {
-    await tgApi("sendMessage", {
-      chat_id,
-      text: "⏳ No active round right now. A new one will start soon!"
-    });
-  } else {
-    const now = new Date();
-    const end = new Date(round.round_end);
-    const secondsLeft = Math.max(0, Math.floor((end - now) / 1000));
-    const minutes = Math.floor(secondsLeft / 60);
-    const seconds = secondsLeft % 60;
-
-    await tgApi("sendMessage", {
-      chat_id,
-      text: `⏱ Round ends in ${minutes}m ${seconds}s`
-    });
-  }
-}
-
-
-    // No-op for other updates
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("telegram/webhook error:", e);
-    res.status(200).json({ ok: true }); // don't make Telegram retry forever
-  }
-});
-
-
 // ---------- Health ----------
 app.get("/health", async (_req, res) => {
   try {
