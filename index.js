@@ -373,20 +373,23 @@ app.post("/cron/pull", async (req, res) => {
   }
 });
 
-// ---------- CRON: post round results to Telegram ----------
+// ---------- CRON: Send round results ----------
 app.post("/cron/round-results", async (req, res) => {
   try {
-    const secret = req.get("x-cron-secret");
-    if (secret !== CRON_SECRET) {
+    // Verify cron secret
+    const hdr = req.get("x-cron-secret");
+    if (CRON_SECRET && hdr !== CRON_SECRET) {
       return res.status(401).json({ error: "unauthorized" });
     }
 
-    // 1. Find the last round that has ended
     const now = new Date().toISOString();
+
+    // 1. Find the most recently ended round that has NOT been processed yet
     const { rows } = await pool.query(
       `select *
        from rounds
        where round_end <= $1
+       and results_sent = false
        order by round_end desc
        limit 1`,
       [now]
@@ -396,37 +399,47 @@ app.post("/cron/round-results", async (req, res) => {
       return res.json({ ok: true, message: "No finished rounds yet" });
     }
 
-    const lastRound = rows[0];
+    const round = rows[0];
+    console.log("Sending results for round:", round.id);
 
-    // 2. Format summary message
-    let message = `🏁 Round finished!\n\n`;
-    message += `🕐 Start: ${new Date(lastRound.round_start).toLocaleTimeString()} UTC\n`;
-    message += `🕐 End: ${new Date(lastRound.round_end).toLocaleTimeString()} UTC\n\n`;
-    message += `🎯 Tokens in this round:\n`;
+    // 2. Mark round as processed (results_sent = true)
+    await pool.query(
+      `update rounds set results_sent = true where id = $1`,
+      [round.id]
+    );
 
-    lastRound.tokens.forEach((t, i) => {
-      message += `${i + 1}. ${t.symbol} (${t.name})\n`;
-    });
+    // 3. Build results message
+    let text = `🏁 Round finished!\n\n`;
+    if (round.tokens && Array.isArray(round.tokens)) {
+      text += round.tokens.map((t, i) =>
+        `${i + 1}. ${t.symbol} (${t.name})\n` +
+        `   💵 Price: $${t.price?.toFixed(6) ?? 0}\n` +
+        `   📊 Volume 24h: $${t.volume24h ?? 0}\n`
+      ).join("\n");
+    } else {
+      text += "No tokens in this round 🤷";
+    }
 
-    // 3. Send message to all Telegram users
-    const { rows: users } = await pool.query(`select chat_id from telegram_users`);
-    for (const u of users) {
+    // 4. Get all Telegram chat IDs
+    const chats = await pool.query(`select chat_id from telegram_users`);
+    const chatIds = chats.rows.map(r => r.chat_id);
+
+    // 5. Send results to each chat
+    for (const chat_id of chatIds) {
       try {
-        await tgApi("sendMessage", {
-          chat_id: u.chat_id,
-          text: message
-        });
+        await tgApi("sendMessage", { chat_id, text });
       } catch (err) {
-        console.error(`Failed to send to ${u.chat_id}:`, err.message);
+        console.error("Failed to send to chat", chat_id, err.message);
       }
     }
 
-    res.json({ ok: true, posted: true, round_id: lastRound.id, recipients: users.length });
+    res.json({ ok: true, message: "Round results sent", round_id: round.id, sent_to: chatIds.length });
   } catch (e) {
-    console.error("Cron round-results failed:", e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("cron/round-results error:", e);
+    res.status(500).json({ error: "Failed to send round results" });
   }
 });
+
 
 
 // ---------- Telegram Webhook ----------
@@ -497,6 +510,7 @@ app.post("/telegram/webhook", async (req, res) => {
     res.status(200).json({ ok: true }); // prevent Telegram retry loop
   }
 });
+
 
 
 
