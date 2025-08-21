@@ -596,7 +596,8 @@ app.post("/cron/manage-rounds", async (req, res) => {
 
 
 // ---------- Telegram Webhook ----------
-app.post("/telegram/webhook", async (req,fres) => {
+// ---------- Telegram Webhook ----------
+app.post("/telegram/webhook", async (req, res) => {
   try {
     // Verify Telegram's secret token (set when you called setWebhook)
     const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
@@ -609,27 +610,25 @@ app.post("/telegram/webhook", async (req,fres) => {
 
     if (msg) {
       const chat_id = msg.chat.id;
-// --- Save user in DB (with error logging) ---
-try {
-  const userId = msg.from?.id?.toString() || null;
-  const username = msg.from?.username || msg.from?.first_name || "anon";
+      // --- Save user in DB (with error logging) ---
+      try {
+        const userId = msg.from?.id?.toString() || null;
+        const username = msg.from?.username || msg.from?.first_name || "anon";
 
-  await pool.query(
-    `insert into telegram_users (chat_id, user_id, username, first_seen, last_seen)
-     values ($1, $2, $3, now(), now())
-     on conflict (chat_id) do update
-       set user_id = excluded.user_id,
-           username = excluded.username,
-           last_seen = now()`,
-    [chat_id, userId, username]
-  );
+        await pool.query(
+          `insert into telegram_users (chat_id, user_id, username, first_seen, last_seen)
+           values ($1, $2, $3, now(), now())
+           on conflict (chat_id) do update
+             set user_id = excluded.user_id,
+                 username = excluded.username,
+                 last_seen = now()`,
+          [chat_id, userId, username]
+        );
 
-  console.log("✅ Saved Telegram user:", { chat_id, userId, username });
-} catch (dbErr) {
-  console.error("❌ Failed to save Telegram user:", dbErr);
-}
-
-
+        console.log("✅ Saved Telegram user:", { chat_id, userId, username });
+      } catch (dbErr) {
+        console.error("❌ Failed to save Telegram user:", dbErr);
+      }
 
       console.log("Incoming chat:", msg.chat);
     }
@@ -651,7 +650,6 @@ try {
     // Handle /timer
     if (msg?.text?.startsWith("/timer")) {
       const chat_id = msg.chat.id;
-
       const round = await getCurrentRound();
       if (!round) {
         await tgApi("sendMessage", {
@@ -679,6 +677,7 @@ try {
     res.status(200).json({ ok: true }); // don't retry forever
   }
 });
+
 
 
 
