@@ -803,24 +803,39 @@ app.get("/tokens/:address/history", async (req, res) => {
 
 // ---------- WRITE: submit a play (with debug logs) ----------
 // ------ Save a play (user's selections) ----------
+// ---------- Save Player's Play ----------
 app.post("/plays", async (req, res) => {
   try {
-    const user = await getUserFromTelegram(req); // auth
-    const { selections } = req.body;
+    const { chat_id, selections } = req.body;
 
-    const { rows } = await pool.query(
-      `insert into plays (user_id, round_id, selections)
-       values ($1, (select id from rounds order by round_start desc limit 1), $2)
-       returning id`,
-      [user.id, JSON.stringify(selections)]
+    if (!chat_id || !selections) {
+      return res.status(400).json({ ok: false, error: "Missing chat_id or selections" });
+    }
+
+    // Make sure player exists in telegram_users
+    const { rows: userRows } = await pool.query(
+      `select chat_id, username from telegram_users where chat_id = $1`,
+      [chat_id]
+    );
+    if (!userRows.length) {
+      return res.status(400).json({ ok: false, error: "Unknown user" });
+    }
+
+    // Insert into plays table
+    const id = crypto.randomUUID();
+    await pool.query(
+      `insert into plays (id, user_id, username, selections)
+       values ($1, $2, $3, $4)`,
+      [id, chat_id.toString(), userRows[0].username, JSON.stringify(selections)]
     );
 
-    res.json({ ok: true, playId: rows[0].id });
+    res.json({ ok: true, playId: id });
   } catch (e) {
     console.error("plays error", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
