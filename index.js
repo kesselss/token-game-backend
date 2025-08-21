@@ -133,7 +133,7 @@ app.get("/rounds/current", async (_req, res) => {
   try {
     const now = new Date().toISOString();
 
-    // 1. Look up the active round (where now is between start and end)
+    // Look up the active round (where now is between start and end)
     const { rows } = await pool.query(
       `select *
        from rounds
@@ -160,6 +160,7 @@ app.get("/rounds/current", async (_req, res) => {
     res.status(500).json({ error: "Failed to fetch current round" });
   }
 });
+
 
 
 
