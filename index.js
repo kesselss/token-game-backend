@@ -421,72 +421,88 @@ app.post("/cron/round-results", async (req, res) => {
 
 // ---------- SAVE PLAYER RESULT + SEND TG MESSAGE ----------
 app.post("/results/submit", async (req, res) => {
-  try {
-    const { playId } = req.body;
-    if (!playId) {
-      return res.status(400).json({ error: "Missing playId" });
-    }
+ try {
+   const { playId } = req.body;
+   if (!playId) {
+     return res.status(400).json({ error: "Missing playId" });
+   }
 
-    // Load the play
-    const { rows: plays } = await pool.query("SELECT * FROM plays WHERE id=$1", [playId]);
-    if (!plays.length) {
-      return res.status(404).json({ error: "Play not found" });
-    }
-    const play = plays[0];
-    const selections = play.selections || [];
-    const timestamp = play.timestamp;
+   // Load the play
+   const { rows: plays } = await pool.query("SELECT * FROM plays WHERE id=$1", [playId]);
+   if (!plays.length) {
+     return res.status(404).json({ error: "Play not found" });
+   }
+   const play = plays[0];
+   const selections = play.selections || [];
+   const timestamp = play.timestamp;
 
-    // Calculate PnL (same logic as leaderboard)
-    let totalPnl = 0;
-    let count = 0;
+   // Get current round
+   const round = await getCurrentRound();
+   if (!round) {
+     return res.status(400).json({ error: "No active round" });
+   }
 
-    for (const sel of selections) {
-      const { address, direction } = sel;
-      if (!address) continue;
+   // Calculate PnL (same logic as leaderboard)
+   let totalPnl = 0;
+   let count = 0;
 
-      // Entry price = closest snapshot <= play.timestamp
-      const entryQ = await pool.query(
-        `select price from token_history
-         where address=$1 and ts <= $2
-         order by ts desc limit 1`,
-        [address, timestamp]
-      );
+   for (const sel of selections) {
+     const { address, direction } = sel;
+     if (!address) continue;
 
-      // Exit price = most recent snapshot
-      const exitQ = await pool.query(
-        `select price from token_history
-         where address=$1
-         order by ts desc limit 1`,
-        [address]
-      );
+     // Entry price = closest snapshot <= play.timestamp
+     const entryQ = await pool.query(
+       `select price from token_history
+        where address=$1 and ts <= $2
+        order by ts desc limit 1`,
+       [address, timestamp]
+     );
 
-      if (entryQ.rows.length && exitQ.rows.length) {
-        let pnl = ((exitQ.rows[0].price - entryQ.rows[0].price) / entryQ.rows[0].price) * 100;
-        if (direction === "short") pnl *= -1;
-        totalPnl += pnl;
-        count++;
-      }
-    }
+     // Exit price = most recent snapshot
+     const exitQ = await pool.query(
+       `select price from token_history
+        where address=$1
+        order by ts desc limit 1`,
+       [address]
+     );
 
-    const avgPnl = count ? totalPnl / count : 0;
+     if (entryQ.rows.length && exitQ.rows.length) {
+       let pnl = ((exitQ.rows[0].price - entryQ.rows[0].price) / entryQ.rows[0].price) * 100;
+       if (direction === "short") pnl *= -1;
+       totalPnl += pnl;
+       count++;
+     }
+   }
 
-    // Build TG message
-    let text = `📊 Your round is locked!\n\nPnL: ${avgPnl.toFixed(2)}%\n\n`;
-    text += selections.map(s => `${s.symbol} ${s.direction.toUpperCase()}`).join("\n");
+   const avgPnl = count ? totalPnl / count : 0;
 
-    // Send to Telegram user
-    await tgApi("sendMessage", {
-      chat_id: play.user_id,
-      text
-    });
+   // Save to round_results table
+   await pool.query(
+     `INSERT INTO round_results (round_id, chat_id, portfolio, pnl, choices)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (round_id, chat_id) DO UPDATE SET
+      portfolio = excluded.portfolio,
+      pnl = excluded.pnl,
+      choices = excluded.choices`,
+     [round.id, play.user_id, JSON.stringify(selections), avgPnl, JSON.stringify(selections)]
+   );
 
-    res.json({ ok: true, pnl: avgPnl });
-  } catch (e) {
-    console.error("Error in /results/submit:", e);
-    res.status(500).json({ error: "Failed to compute/submit result" });
-  }
+   // Build TG message
+   let text = `📊 Your round is locked!\n\nPnL: ${avgPnl.toFixed(2)}%\n\n`;
+   text += selections.map(s => `${s.symbol} ${s.direction.toUpperCase()}`).join("\n");
+
+   // Send to Telegram user
+   await tgApi("sendMessage", {
+     chat_id: play.user_id,
+     text
+   });
+
+   res.json({ ok: true, pnl: avgPnl });
+ } catch (e) {
+   console.error("Error in /results/submit:", e);
+   res.status(500).json({ error: "Failed to compute/submit result" });
+ }
 });
-
 
 
 
