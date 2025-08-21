@@ -810,78 +810,40 @@ app.post("/plays", async (req, res) => {
 
 
 // ---------- READ: leaderboard (24h cycle, ranked by PnL) ----------
-app.get("/leaderboard", async (_req, res) => {
+// ---------- Leaderboard ----------
+app.get("/leaderboard", async (req, res) => {
   try {
-    // Get most recent play per user within today’s UTC cycle
-    const playsQ = `
-      select distinct on (user_id) id, user_id, username, selections, timestamp
-      from plays
-      where timestamp >= date_trunc('day', now() at time zone 'utc')
-      order by user_id, timestamp desc
-    `;
-    const { rows } = await pool.query(playsQ);
-
-    const entries = [];
-
-    for (const play of rows) {
-      const selections = play.selections || [];
-      let totalPnl = 0;
-      let count = 0;
-
-      for (const sel of selections) {
-        const { address, direction } = sel;
-        if (!address) continue;
-
-        // Entry = closest snapshot at or before play.timestamp
-        const { rows: entry } = await pool.query(
-          `select price from token_history
-           where address=$1 and ts <= $2
-           order by ts desc limit 1`,
-          [address, play.timestamp]
-        );
-
-        // Exit = latest snapshot (most recent price)
-        const { rows: exit } = await pool.query(
-          `select price from token_history
-           where address=$1
-           order by ts desc limit 1`,
-          [address]
-        );
-
-        if (entry.length && exit.length) {
-          let pnl = ((exit[0].price - entry[0].price) / entry[0].price) * 100;
-          if (direction === "short") pnl *= -1;
-          totalPnl += pnl;
-          count++;
-        }
-      }
-
-      const avgPnl = count ? totalPnl / count : 0;
-      const longs = selections.filter(s => s.direction === "long").length;
-      const shorts = selections.filter(s => s.direction === "short").length;
-
-      entries.push({
-        user_id: play.user_id,
-        player: play.username,
-        pnl: avgPnl,
-        longs,
-        shorts,
-        selections
-      });
+    // Find the most recent finished round
+    const { rows: rounds } = await pool.query(
+      `select id
+       from rounds
+       where round_end < now()
+       order by round_end desc
+       limit 1`
+    );
+    if (!rounds.length) {
+      return res.json({ ok: true, leaderboard: [] });
     }
+    const roundId = rounds[0].id;
 
-    // Sort by pnl descending
-    entries.sort((a, b) => b.pnl - a.pnl);
+    // Fetch leaderboard from round_results
+    const { rows } = await pool.query(
+      `select u.username, r.pnl
+       from round_results r
+       join users u on u.id = r.user_id
+       where r.round_id = $1
+       order by r.pnl desc
+       limit 10`,
+      [roundId]
+    );
 
-    res.json({
-      round_date: new Date().toISOString().slice(0, 10),
-      entries
-    });
+    res.json({ ok: true, leaderboard: rows });
   } catch (e) {
-    console.error("Error loading leaderboard:", e);
-    res.status(500).json({ error: "Failed to fetch leaderboard" });
+    console.error("leaderboard error", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
