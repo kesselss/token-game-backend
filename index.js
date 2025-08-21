@@ -536,7 +536,7 @@ async function finishRound(round) {
 }
 
 
-  }
+  
 
   // Build leaderboard text
   const leaderboard = await buildLeaderboard(round.id);
@@ -556,8 +556,6 @@ async function finishRound(round) {
 
   // Mark results sent
   await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
-}
-
 
 
 
