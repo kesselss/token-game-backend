@@ -466,31 +466,34 @@ async function startNewRound() {
 async function finishRound(round) {
   // Fetch all plays for this round
   const { rows: plays } = await pool.query(
-    `select p.id, p.user_id, p.username, p.selections, t.chat_id
-     from plays p
-     join telegram_users t on t.user_id::text = p.user_id::text
-     where p.timestamp between $1 and $2`,
-    [round.round_start, round.round_end]
-  );
+  `select p.id, p.user_id, p.username, p.selections, t.chat_id
+   from plays p
+   join telegram_users t on t.user_id::text = p.user_id::text
+   where p.timestamp between $1 and $2`,
+  [round.round_start, round.round_end]
+);
+
 
   for (const play of plays) {
     // Compute PnL from selections vs token history
     const pnl = await calculatePnL(play.selections, round);
 
     // Save into round_results (chat_id-based schema)
-    await pool.query(
-      `insert into round_results (round_id, chat_id, portfolio, pnl, choices)
-       values ($1, $2, $3, $4, $5)
-       on conflict (round_id, chat_id) do update
-       set portfolio = excluded.portfolio, pnl = excluded.pnl, choices = excluded.choices`,
-      [
-        round.id,
-        play.chat_id,
-        JSON.stringify(play.selections),
-        pnl,
-        JSON.stringify(play.selections)
-      ]
-    );
+await pool.query(
+  `insert into round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
+   values ($1, $2, $3, $4, $5, $6)
+   on conflict (round_id, user_id) do update
+   set portfolio = excluded.portfolio, pnl = excluded.pnl, choices = excluded.choices`,
+  [
+    round.id,
+    play.user_id,
+    play.chat_id,
+    JSON.stringify(play.selections),
+    pnl,
+    JSON.stringify(play.selections)
+  ]
+);
+
   }
 
   // Build leaderboard text
@@ -519,14 +522,15 @@ async function finishRound(round) {
 // ---------- Build Leaderboard ----------
 async function buildLeaderboard(roundId) {
   const { rows } = await pool.query(
-    `select t.username, r.pnl
-     from round_results r
-     join telegram_users t on t.chat_id = r.chat_id
-     where r.round_id = $1
-     order by r.pnl desc
-     limit 10`,
-    [roundId]
-  );
+  `select t.username, r.pnl
+   from round_results r
+   join telegram_users t on t.user_id::text = r.user_id::text
+   where r.round_id = $1
+   order by r.pnl desc
+   limit 10`,
+  [roundId]
+);
+
 
   if (!rows.length) {
     return "No results yet.";
@@ -592,7 +596,7 @@ app.post("/cron/manage-rounds", async (req, res) => {
 
 
 // ---------- Telegram Webhook ----------
-app.post("/telegram/webhook", async (req, res) => {
+app.post("/telegram/webhook", async (req,fres) => {
   try {
     // Verify Telegram's secret token (set when you called setWebhook)
     const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
@@ -624,6 +628,7 @@ try {
 } catch (dbErr) {
   console.error("❌ Failed to save Telegram user:", dbErr);
 }
+
 
 
       console.log("Incoming chat:", msg.chat);
@@ -813,27 +818,13 @@ app.get("/tokens/:address/history", async (req, res) => {
 // ---------- Save Player's Play ----------
 app.post("/plays", async (req, res) => {
   try {
-    const { chat_id, selections } = req.body;
-
-    if (!chat_id || !selections) {
-      return res.status(400).json({ ok: false, error: "Missing chat_id or selections" });
-    }
-
-    // Make sure player exists in telegram_users
-    const { rows: userRows } = await pool.query(
-      `select chat_id, username from telegram_users where chat_id = $1`,
-      [chat_id]
-    );
-    if (!userRows.length) {
-      return res.status(400).json({ ok: false, error: "Unknown user" });
-    }
-
-    // Insert into plays table
+    const body = req.body;
     const id = crypto.randomUUID();
+
     await pool.query(
       `insert into plays (id, user_id, username, selections)
        values ($1, $2, $3, $4)`,
-      [id, chat_id.toString(), userRows[0].username, JSON.stringify(selections)]
+      [id, body.user_id.toString(), body.username, JSON.stringify(body.selections)]
     );
 
     res.json({ ok: true, playId: id });
@@ -842,6 +833,7 @@ app.post("/plays", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
