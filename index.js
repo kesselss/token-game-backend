@@ -543,26 +543,6 @@ async function finishRound(round) {
 }
 
 
-  
-
-  // Send to all Telegram users
-  const { rows: users } = await pool.query(`select chat_id from telegram_users`);
-  for (const u of users) {
-    try {
-      await tgApi("sendMessage", {
-        chat_id: u.chat_id,
-        text: `⏳ Round ended!\n\n${leaderboard}`
-      });
-    } catch (e) {
-      console.error("Failed to send round end to", u.chat_id, e.message);
-    }
-  }
-
-  // Mark results sent
-  await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
-
-
-
 // ---------- Build Leaderboard ----------
 async function buildLeaderboard(roundId) {
   const { rows } = await pool.query(
