@@ -427,6 +427,77 @@ app.post("/cron/round-results", async (req, res) => {
 });
 
 
+// ---------- Telegram Webhook ----------
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    // Verify Telegram's secret token (set when you call setWebhook)
+    const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
+    if (TELEGRAM_WEBHOOK_SECRET && hdr !== TELEGRAM_WEBHOOK_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const update = req.body || {};
+    const msg = update.message || update.edited_message || null;
+    if (!msg) {
+      return res.json({ ok: true });
+    }
+
+    // --- Minimal user tracking ---
+    await pool.query(
+      `insert into telegram_users (chat_id, first_seen, last_seen)
+       values ($1, now(), now())
+       on conflict (chat_id) do update
+         set last_seen = now()`,
+      [msg.chat.id]
+    );
+
+    // ---------- Handle /start ----------
+    if (msg?.text?.startsWith("/start")) {
+      const chat_id = msg.chat.id;
+      await tgApi("sendMessage", {
+        chat_id,
+        text: "🚀 Meme Draft is ready. Tap to play:",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
+          ]]
+        }
+      });
+    }
+
+    // ---------- Handle /timer ----------
+    if (msg?.text?.startsWith("/timer")) {
+      const chat_id = msg.chat.id;
+
+      const round = await getCurrentRound();
+      if (!round) {
+        await tgApi("sendMessage", {
+          chat_id,
+          text: "⏳ No active round right now. A new one will start soon!"
+        });
+      } else {
+        const now = new Date();
+        const end = new Date(round.round_end);
+        const secondsLeft = Math.max(0, Math.floor((end - now) / 1000));
+        const minutes = Math.floor(secondsLeft / 60);
+        const seconds = secondsLeft % 60;
+
+        await tgApi("sendMessage", {
+          chat_id,
+          text: `⏱ Round ends in ${minutes}m ${seconds}s`
+        });
+      }
+    }
+
+    res.json({ ok: true }); // Always reply to Telegram
+  } catch (e) {
+    console.error("telegram/webhook error:", e);
+    res.status(200).json({ ok: true }); // prevent Telegram retry loop
+  }
+});
+
+
+
 
 
 // ---------- Round helpers ----------
@@ -657,77 +728,6 @@ app.get("/leaderboard", async (_req, res) => {
   }
 });
 
-
-
-// ---------- Telegram Webhook ----------
-app.post("/telegram/webhook", async (req, res) => {
-  try {
-    // Verify Telegram's secret token (set when you call setWebhook)
-    const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
-    if (TELEGRAM_WEBHOOK_SECRET && hdr !== TELEGRAM_WEBHOOK_SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const update = req.body || {};
-    const msg = update.message || update.edited_message || null;
-    if (!msg) {
-      return res.json({ ok: true });
-    }
-
-    // --- Minimal user tracking (insert or update) ---
-    await pool.query(
-      `insert into telegram_users (chat_id, first_seen, last_seen)
-       values ($1, now(), now())
-       on conflict (chat_id) do update
-         set last_seen = now()`,
-      [msg.chat.id]
-    );
-
-    // ---------- Handle /start ----------
-    if (msg?.text?.startsWith("/start")) {
-      const chat_id = msg.chat.id;
-      await tgApi("sendMessage", {
-        chat_id,
-        text: "🚀 Meme Draft is ready. Tap to play:",
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
-          ]]
-        }
-      });
-    }
-
-    // ---------- Handle /timer ----------
-    if (msg?.text?.startsWith("/timer")) {
-      const chat_id = msg.chat.id;
-
-      const round = await getCurrentRound();
-      if (!round) {
-        await tgApi("sendMessage", {
-          chat_id,
-          text: "⏳ No active round right now. A new one will start soon!"
-        });
-      } else {
-        const now = new Date();
-        const end = new Date(round.round_end);
-        const secondsLeft = Math.max(0, Math.floor((end - now) / 1000));
-        const minutes = Math.floor(secondsLeft / 60);
-        const seconds = secondsLeft % 60;
-
-        await tgApi("sendMessage", {
-          chat_id,
-          text: `⏱ Round ends in ${minutes}m ${seconds}s`
-        });
-      }
-    }
-
-    // Always respond to Telegram so it doesn't retry
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("telegram/webhook error:", e);
-    res.status(200).json({ ok: true }); // prevent Telegram retry loop
-  }
-});
 
 
 // Handle /timer
