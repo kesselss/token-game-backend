@@ -344,26 +344,41 @@ app.post("/cron/pull", async (req, res) => {
   }
 });
 
-// ---------- CRON: Send round results ----------
+// ---------- Build leaderboard for a finished round ----------
+async function buildLeaderboard(roundId) {
+  // Get all results for that round
+  const { rows } = await pool.query(
+    `select r.chat_id, r.pnl, r.choices, u.chat_id as id
+     from round_results r
+     join telegram_users u on u.chat_id = r.chat_id
+     where r.round_id = $1
+     order by r.pnl desc`,
+    [roundId]
+  );
+
+  if (!rows.length) return "No results for this round 🤷";
+
+  let text = "🏆 Round Leaderboard 🏆\n\n";
+  rows.forEach((row, i) => {
+    text += `${i + 1}. User ${row.chat_id}\n   📈 PnL: ${row.pnl.toFixed(2)}%\n`;
+  });
+  return text;
+}
+
+// ---------- CRON: send round results ----------
 app.post("/cron/round-results", async (req, res) => {
   try {
-    // Verify cron secret
     const hdr = req.get("x-cron-secret");
     if (CRON_SECRET && hdr !== CRON_SECRET) {
       return res.status(401).json({ error: "unauthorized" });
     }
 
-    const now = new Date().toISOString();
-
-    // 1. Find the most recently ended round that has NOT been processed yet
+    // 1. Find the last finished round that hasn't had results sent
     const { rows } = await pool.query(
-      `select *
-       from rounds
-       where round_end <= $1
-       and results_sent = false
+      `select * from rounds
+       where round_end < now() and coalesce(results_sent, false) = false
        order by round_end desc
-       limit 1`,
-      [now]
+       limit 1`
     );
 
     if (!rows.length) {
@@ -371,45 +386,107 @@ app.post("/cron/round-results", async (req, res) => {
     }
 
     const round = rows[0];
-    console.log("Sending results for round:", round.id);
 
-    // 2. Mark round as processed (results_sent = true)
-    await pool.query(
-      `update rounds set results_sent = true where id = $1`,
-      [round.id]
+    // 2. Build leaderboard text
+    const leaderboard = await buildLeaderboard(round.id);
+
+    // 3. Load all telegram users
+    const { rows: users } = await pool.query(
+      `select chat_id from telegram_users`
     );
 
-    // 3. Build results message
-    let text = `🏁 Round finished!\n\n`;
-    if (round.tokens && Array.isArray(round.tokens)) {
-      text += round.tokens.map((t, i) =>
-        `${i + 1}. ${t.symbol} (${t.name})\n` +
-        `   💵 Price: $${t.price?.toFixed(6) ?? 0}\n` +
-        `   📊 Volume 24h: $${t.volume24h ?? 0}\n`
-      ).join("\n");
-    } else {
-      text += "No tokens in this round 🤷";
-    }
-
-    // 4. Get all Telegram chat IDs
-    const chats = await pool.query(`select chat_id from telegram_users`);
-    const chatIds = chats.rows.map(r => r.chat_id);
-
-    // 5. Send results to each chat
-    for (const chat_id of chatIds) {
+    // 4. Send leaderboard to each user
+    for (const u of users) {
       try {
-        await tgApi("sendMessage", { chat_id, text });
-      } catch (err) {
-        console.error("Failed to send to chat", chat_id, err.message);
+        await tgApi("sendMessage", {
+          chat_id: u.chat_id,
+          text: leaderboard
+        });
+      } catch (e) {
+        console.error("Failed to send to", u.chat_id, e.message);
       }
     }
 
-    res.json({ ok: true, message: "Round results sent", round_id: round.id, sent_to: chatIds.length });
+    // 5. Mark round as results_sent
+    await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
+
+    res.json({ ok: true, message: "Round results sent", round_id: round.id, sent_to: users.length });
   } catch (e) {
     console.error("cron/round-results error:", e);
-    res.status(500).json({ error: "Failed to send round results" });
+    res.status(500).json({ error: "failed to send round results" });
   }
 });
+
+
+
+// ---------- SAVE PLAYER RESULT + SEND TG MESSAGE ----------
+app.post("/results/submit", async (req, res) => {
+  try {
+    const { playId } = req.body;
+    if (!playId) {
+      return res.status(400).json({ error: "Missing playId" });
+    }
+
+    // Load the play
+    const { rows: plays } = await pool.query("SELECT * FROM plays WHERE id=$1", [playId]);
+    if (!plays.length) {
+      return res.status(404).json({ error: "Play not found" });
+    }
+    const play = plays[0];
+    const selections = play.selections || [];
+    const timestamp = play.timestamp;
+
+    // Calculate PnL (same logic as leaderboard)
+    let totalPnl = 0;
+    let count = 0;
+
+    for (const sel of selections) {
+      const { address, direction } = sel;
+      if (!address) continue;
+
+      // Entry price = closest snapshot <= play.timestamp
+      const entryQ = await pool.query(
+        `select price from token_history
+         where address=$1 and ts <= $2
+         order by ts desc limit 1`,
+        [address, timestamp]
+      );
+
+      // Exit price = most recent snapshot
+      const exitQ = await pool.query(
+        `select price from token_history
+         where address=$1
+         order by ts desc limit 1`,
+        [address]
+      );
+
+      if (entryQ.rows.length && exitQ.rows.length) {
+        let pnl = ((exitQ.rows[0].price - entryQ.rows[0].price) / entryQ.rows[0].price) * 100;
+        if (direction === "short") pnl *= -1;
+        totalPnl += pnl;
+        count++;
+      }
+    }
+
+    const avgPnl = count ? totalPnl / count : 0;
+
+    // Build TG message
+    let text = `📊 Your round is locked!\n\nPnL: ${avgPnl.toFixed(2)}%\n\n`;
+    text += selections.map(s => `${s.symbol} ${s.direction.toUpperCase()}`).join("\n");
+
+    // Send to Telegram user
+    await tgApi("sendMessage", {
+      chat_id: play.user_id,
+      text
+    });
+
+    res.json({ ok: true, pnl: avgPnl });
+  } catch (e) {
+    console.error("Error in /results/submit:", e);
+    res.status(500).json({ error: "Failed to compute/submit result" });
+  }
+});
+
 
 
 
