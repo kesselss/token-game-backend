@@ -131,35 +131,6 @@ app.use(telegramAuth);
 
 
 
-// Telegram webhook endpoint
-app.post("/telegram/webhook", async (req, res) => {
-  console.log("Telegram update:", req.body);
-
-  const update = req.body || {};
-  const msg = update.message || update.edited_message;
-
-  if (msg?.text?.startsWith("/start")) {
-    const chat_id = msg.chat.id;
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id,
-        text: "🚀 Meme Draft is ready. Tap to play:",
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
-          ]]
-        }
-      })
-    });
-  }
-
-  res.json({ ok: true }); // must always reply 200
-});
-
-
-
 // --- CORS ---
 app.use(
   cors({
@@ -457,15 +428,20 @@ app.post("/telegram/webhook", async (req, res) => {
     if (msg) {
       const chat_id = msg.chat.id;
 
-      // --- Always save/update user in DB ---
-      await pool.query(
-        `insert into telegram_users (chat_id, first_seen, last_seen)
-         values ($1, now(), now())
-         on conflict (chat_id) do update set last_seen = now()`,
-        [chat_id]
-      );
+      // --- Save user in DB (with error logging) ---
+      try {
+        await pool.query(
+          `insert into telegram_users (chat_id, first_seen, last_seen)
+           values ($1, now(), now())
+           on conflict (chat_id) do update set last_seen = now()`,
+          [chat_id]
+        );
+        console.log("✅ Saved chat_id to DB:", chat_id);
+      } catch (dbErr) {
+        console.error("❌ Failed to save chat_id:", chat_id, dbErr);
+      }
 
-      console.log("Incoming chat saved:", chat_id);
+      console.log("Incoming chat:", msg.chat);
     }
 
     // Handle /start
@@ -513,6 +489,7 @@ app.post("/telegram/webhook", async (req, res) => {
     res.status(200).json({ ok: true }); // don't retry forever
   }
 });
+
 
 
 
