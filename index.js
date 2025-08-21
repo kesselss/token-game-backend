@@ -622,21 +622,35 @@ async function getCurrentRound() {
 
 
 
-// ---------- READ: current round ----------
 app.get("/rounds/current", async (_req, res) => {
   try {
     let round = await getCurrentRound();
-
-    // If no active round → create one
     if (!round) {
       round = await createNewRound();
     }
+
+    // Transform the raw Birdeye data to match frontend schema
+    const transformedTokens = (round.tokens || []).map(token => ({
+      address: token.address,
+      symbol: token.symbol,
+      name: token.name,
+      logoURI: token.logo_uri,  // logo_uri -> logoURI
+      price: token.price,
+      marketcap: token.market_cap,  // market_cap -> marketcap
+      liquidity: token.liquidity,
+      volume24h: token.volume_24h_usd,  // volume_24h_usd -> volume24h
+      priceChange24h: token.price_change_24h_percent,  // price_change_24h_percent -> priceChange24h
+      holders: token.holder,  // holder -> holders
+      top10HolderPercent: null, // Not available in meme list API
+      launchedAt: token.meme_info?.creation_time ? new Date(token.meme_info.creation_time * 1000).toISOString() : null,
+      updated_at: new Date().toISOString()
+    }));
 
     res.json({
       id: round.id,
       start: round.round_start,
       end: round.round_end,
-      tokens: round.tokens
+      tokens: transformedTokens
     });
   } catch (e) {
     console.error("Error fetching current round:", e);
