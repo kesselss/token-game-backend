@@ -605,19 +605,26 @@ app.post("/telegram/webhook", async (req, res) => {
 
     if (msg) {
       const chat_id = msg.chat.id;
+// --- Save user in DB (with error logging) ---
+try {
+  const userId = msg.from?.id?.toString() || null;
+  const username = msg.from?.username || msg.from?.first_name || "anon";
 
-      // --- Save user in DB (with error logging) ---
-      try {
-        await pool.query(
-          `insert into telegram_users (chat_id, first_seen, last_seen)
-           values ($1, now(), now())
-           on conflict (chat_id) do update set last_seen = now()`,
-          [chat_id]
-        );
-        console.log("✅ Saved chat_id to DB:", chat_id);
-      } catch (dbErr) {
-        console.error("❌ Failed to save chat_id:", chat_id, dbErr);
-      }
+  await pool.query(
+    `insert into telegram_users (chat_id, user_id, username, first_seen, last_seen)
+     values ($1, $2, $3, now(), now())
+     on conflict (chat_id) do update
+       set user_id = excluded.user_id,
+           username = excluded.username,
+           last_seen = now()`,
+    [chat_id, userId, username]
+  );
+
+  console.log("✅ Saved Telegram user:", { chat_id, userId, username });
+} catch (dbErr) {
+  console.error("❌ Failed to save Telegram user:", dbErr);
+}
+
 
       console.log("Incoming chat:", msg.chat);
     }
