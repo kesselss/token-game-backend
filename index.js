@@ -200,6 +200,16 @@ const BE_HEADERS = {
   "X-API-KEY": BIRDEYE_API_KEY
 };
 
+// ---------- Birdeye: fetch top meme tokens ----------
+async function fetchTopMemeTokens(limit = 20, minVolume = 10000) {
+  const url = `https://public-api.birdeye.so/defi/v3/token/meme/list?sort_by=volume_24h_usd&sort_type=desc&limit=${limit}&min_volume_24h_usd=${minVolume}`;
+  const res = await fetch(url, { headers: BE_HEADERS });
+  if (!res.ok) throw new Error(`Birdeye error ${res.status}`);
+  const json = await res.json();
+  return json?.data?.items || [];
+}
+
+
 async function beJson(url) {
   const res = await fetch(url, { headers: BE_HEADERS });
   if (!res.ok) throw new Error(`Birdeye ${res.status} for ${url}`);
