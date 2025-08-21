@@ -201,13 +201,19 @@ const BE_HEADERS = {
 };
 
 // ---------- Birdeye: fetch top meme tokens ----------
-async function fetchTopMemeTokens(limit = 20, minVolume = 10000) {
-  const url = `https://public-api.birdeye.so/defi/v3/token/meme/list?sort_by=volume_24h_usd&sort_type=desc&limit=${limit}&min_volume_24h_usd=${minVolume}`;
+async function fetchTopMemeTokens(limit = 20, minVolume = 10000, minMarketCap = 100000) {
+  let url = `https://public-api.birdeye.so/defi/v3/token/meme/list?sort_by=volume_24h_usd&sort_type=desc&limit=${limit}&min_volume_24h_usd=${minVolume}`;
+  
+  if (minMarketCap) {
+    url += `&min_market_cap=${minMarketCap}`;
+  }
+
   const res = await fetch(url, { headers: BE_HEADERS });
   if (!res.ok) throw new Error(`Birdeye error ${res.status}`);
   const json = await res.json();
   return json?.data?.items || [];
 }
+
 
 
 async function beJson(url) {
@@ -365,58 +371,135 @@ app.post("/cron/pull", async (req, res) => {
   }
 });
 
-
-// ---------- READ: round of 5 from today's top 20 ----------
-app.get("/rounds/today", async (_req, res) => {
+// ---------- CRON: post round results to Telegram ----------
+app.post("/cron/round-results", async (req, res) => {
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    const secret = req.get("x-cron-secret");
+    if (secret !== CRON_SECRET) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
-    // 1. Load today’s token list from DB
+    // 1. Find the last round that has ended
+    const now = new Date().toISOString();
     const { rows } = await pool.query(
-      `select tokens
-       from daily_token_lists
-       where round_date = $1
+      `select *
+       from rounds
+       where round_end <= $1
+       order by round_end desc
        limit 1`,
-      [today]
+      [now]
     );
 
     if (!rows.length) {
-      return res.status(404).json({ error: "No token list available for today. Cron may not have run yet." });
+      return res.json({ ok: true, message: "No finished rounds yet" });
     }
 
-    const tokenList = rows[0].tokens; // this is the JSON array of 20 tokens
+    const lastRound = rows[0];
 
-    if (!Array.isArray(tokenList) || tokenList.length === 0) {
-      return res.status(500).json({ error: "Invalid token list data" });
+    // 2. Format summary message
+    let message = `🏁 Round finished!\n\n`;
+    message += `🕐 Start: ${new Date(lastRound.round_start).toLocaleTimeString()} UTC\n`;
+    message += `🕐 End: ${new Date(lastRound.round_end).toLocaleTimeString()} UTC\n\n`;
+    message += `🎯 Tokens in this round:\n`;
+
+    lastRound.tokens.forEach((t, i) => {
+      message += `${i + 1}. ${t.symbol} (${t.name})\n`;
+    });
+
+    // 3. Send message to all Telegram users
+    const { rows: users } = await pool.query(`select chat_id from telegram_users`);
+    for (const u of users) {
+      try {
+        await tgApi("sendMessage", {
+          chat_id: u.chat_id,
+          text: message
+        });
+      } catch (err) {
+        console.error(`Failed to send to ${u.chat_id}:`, err.message);
+      }
     }
 
-    // 2. Shuffle and pick 5 random tokens
-    const shuffled = tokenList.sort(() => 0.5 - Math.random());
-    const selected = shuffled.slice(0, 5);
-
-    // 3. Normalize fields to match frontend expectations
-    const tokens = selected.map(t => ({
-      address: t.address,
-      symbol: t.symbol,
-      name: t.name,
-      logoURI: t.logo_uri || "",
-      price: t.price ?? 0,
-      marketcap: t.market_cap ?? 0,
-      liquidity: t.liquidity ?? 0,
-      volume24h: t.volume_24h_usd ?? 0,
-      priceChange24h: t.price_change_24h_percent ?? 0,
-      holders: t.holder ?? 0,
-      top10HolderPercent: null,   // not available from meme/list
-      launchedAt: t.listing_time ? new Date(t.listing_time * 1000) : null,
-      updated_at: new Date()
-    }));
-
-    res.json({ round_date: today, tokens });
+    res.json({ ok: true, posted: true, round_id: lastRound.id, recipients: users.length });
   } catch (e) {
-    console.error("Error fetching round:", e);
-    res.status(500).json({ error: "Failed to fetch round" });
+    console.error("Cron round-results failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+
+
+
+// ---------- Round helpers ----------
+async function createNewRound() {
+  const now = new Date();
+  // Align start time to the current 10-minute block
+  const start = new Date(Math.floor(now.getTime() / (10 * 60 * 1000)) * (10 * 60 * 1000));
+  const end = new Date(start.getTime() + 10 * 60 * 1000);
+
+  // 1. Load today’s token list from daily_token_lists
+  const today = new Date().toISOString().slice(0, 10);
+  const { rows } = await pool.query(
+    `select tokens from daily_token_lists where round_date = $1 limit 1`,
+    [today]
+  );
+
+  if (!rows.length) throw new Error("No daily tokens available. Did cron run?");
+
+  const tokenList = rows[0].tokens;
+
+  // 2. Shuffle and pick 5 random tokens
+  const shuffled = tokenList.sort(() => 0.5 - Math.random());
+  const selected = shuffled.slice(0, 5);
+
+  // 3. Save new round into the 'rounds' table
+  const { rows: inserted } = await pool.query(
+    `insert into rounds (round_start, round_end, tokens)
+     values ($1, $2, $3)
+     returning id, round_start, round_end, tokens`,
+    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+  );
+
+  return inserted[0];
+}
+
+// ---------- Get current active round ----------
+async function getCurrentRound() {
+  const now = new Date().toISOString();
+  const { rows } = await pool.query(
+    `select *
+     from rounds
+     where round_start <= $1 and round_end > $1
+     order by round_start desc
+     limit 1`,
+    [now]
+  );
+  return rows[0] || null;
+}
+
+
+
+// ---------- READ: current round ----------
+app.get("/rounds/current", async (_req, res) => {
+  try {
+    let round = await getCurrentRound();
+
+    // If no active round → create one
+    if (!round) {
+      round = await createNewRound();
+    }
+
+    res.json({
+      id: round.id,
+      start: round.round_start,
+      end: round.round_end,
+      tokens: round.tokens
+    });
+  } catch (e) {
+    console.error("Error fetching current round:", e);
+    res.status(500).json({ error: "Failed to fetch current round" });
+  }
+});
+
 
 
 
@@ -587,8 +670,20 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const update = req.body || {};
     const msg = update.message || update.edited_message || null;
+    if (!msg) {
+      return res.json({ ok: true });
+    }
 
-    // Handle /start
+    // --- Minimal user tracking (insert or update) ---
+    await pool.query(
+      `insert into telegram_users (chat_id, first_seen, last_seen)
+       values ($1, now(), now())
+       on conflict (chat_id) do update
+         set last_seen = now()`,
+      [msg.chat.id]
+    );
+
+    // ---------- Handle /start ----------
     if (msg?.text?.startsWith("/start")) {
       const chat_id = msg.chat.id;
       await tgApi("sendMessage", {
@@ -601,6 +696,64 @@ app.post("/telegram/webhook", async (req, res) => {
         }
       });
     }
+
+    // ---------- Handle /timer ----------
+    if (msg?.text?.startsWith("/timer")) {
+      const chat_id = msg.chat.id;
+
+      const round = await getCurrentRound();
+      if (!round) {
+        await tgApi("sendMessage", {
+          chat_id,
+          text: "⏳ No active round right now. A new one will start soon!"
+        });
+      } else {
+        const now = new Date();
+        const end = new Date(round.round_end);
+        const secondsLeft = Math.max(0, Math.floor((end - now) / 1000));
+        const minutes = Math.floor(secondsLeft / 60);
+        const seconds = secondsLeft % 60;
+
+        await tgApi("sendMessage", {
+          chat_id,
+          text: `⏱ Round ends in ${minutes}m ${seconds}s`
+        });
+      }
+    }
+
+    // Always respond to Telegram so it doesn't retry
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("telegram/webhook error:", e);
+    res.status(200).json({ ok: true }); // prevent Telegram retry loop
+  }
+});
+
+
+// Handle /timer
+if (msg?.text?.startsWith("/timer")) {
+  const chat_id = msg.chat.id;
+
+  const round = await getCurrentRound();
+  if (!round) {
+    await tgApi("sendMessage", {
+      chat_id,
+      text: "⏳ No active round right now. A new one will start soon!"
+    });
+  } else {
+    const now = new Date();
+    const end = new Date(round.round_end);
+    const secondsLeft = Math.max(0, Math.floor((end - now) / 1000));
+    const minutes = Math.floor(secondsLeft / 60);
+    const seconds = secondsLeft % 60;
+
+    await tgApi("sendMessage", {
+      chat_id,
+      text: `⏱ Round ends in ${minutes}m ${seconds}s`
+    });
+  }
+}
+
 
     // No-op for other updates
     res.json({ ok: true });
