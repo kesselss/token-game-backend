@@ -304,7 +304,7 @@ async function insertHistoryRows(address, rows) {
   await pool.query(q, params);
 }
 
-// ---------- CRON: pull data server-side ----------
+// ---------- CRON: pull daily token list + cache snapshots ----------
 app.post("/cron/pull", async (req, res) => {
   try {
     if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
@@ -314,57 +314,101 @@ app.post("/cron/pull", async (req, res) => {
       return res.status(500).json({ ok: false, error: "missing BIRDEYE_API_KEY" });
     }
 
+    const today = new Date().toISOString().slice(0, 10);
+
+    // 1. Fetch today’s top 20 meme tokens by 24h volume
+    const topTokens = await fetchTopMemeTokens(20, 10000);
+
+    if (!Array.isArray(topTokens) || !topTokens.length) {
+      return res.status(500).json({ ok: false, error: "No tokens returned from Birdeye" });
+    }
+
+    // 2. Save list into daily_token_lists (one per day)
+    await pool.query(
+      `insert into daily_token_lists (round_date, tokens)
+       values ($1, $2)
+       on conflict (round_date) do update set tokens = excluded.tokens`,
+      [today, JSON.stringify(topTokens)]
+    );
+
+    // 3. Fetch + cache snapshots/history for each token
     let pulled = 0;
-    for (const address of TOKEN_ALLOWLIST) {
+    for (const t of topTokens) {
       try {
-        const snap = await fetchTokenSnapshot(address);
+        const snap = await fetchTokenSnapshot(t.address);
         await upsertTokenSnapshot(snap);
-        const hist = await fetchHistoryPoints(address);
-        if (hist.length) await insertHistoryRows(address, hist);
+
+        const hist = await fetchHistoryPoints(t.address);
+        if (hist.length) await insertHistoryRows(t.address, hist);
+
         pulled++;
       } catch (e) {
-        console.error("pull error for", address, e.message);
+        console.error("pull error for", t.address, e.message);
       }
       await new Promise((r) => setTimeout(r, 120)); // small pacing
     }
-    res.json({ ok: true, pulled });
+
+    res.json({ ok: true, saved: topTokens.length, pulled });
   } catch (e) {
     console.error("Cron pull failed:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------- READ: round of 5, ready to render ----------
+
+// ---------- READ: round of 5 from today's top 20 ----------
 app.get("/rounds/today", async (_req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-const q = `
-  select
-    address,
-    symbol,
-    name,
-    logo as "logoURI",
-    price,
-    marketcap,
-    liquidity,
-    volume24h,
-    priceChange24h as "priceChange24h",
-    holders,
-    top10HolderPercent as "top10HolderPercent",
-    launchedAt as "launchedAt",
-    updated_at
-  from token_cache
-  order by random()
-  limit 5
-`;
 
-    const result = await pool.query(q);
-    res.json({ round_date: today, tokens: result.rows });
+    // 1. Load today’s token list from DB
+    const { rows } = await pool.query(
+      `select tokens
+       from daily_token_lists
+       where round_date = $1
+       limit 1`,
+      [today]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "No token list available for today. Cron may not have run yet." });
+    }
+
+    const tokenList = rows[0].tokens; // this is the JSON array of 20 tokens
+
+    if (!Array.isArray(tokenList) || tokenList.length === 0) {
+      return res.status(500).json({ error: "Invalid token list data" });
+    }
+
+    // 2. Shuffle and pick 5 random tokens
+    const shuffled = tokenList.sort(() => 0.5 - Math.random());
+    const selected = shuffled.slice(0, 5);
+
+    // 3. Normalize fields to match frontend expectations
+    const tokens = selected.map(t => ({
+      address: t.address,
+      symbol: t.symbol,
+      name: t.name,
+      logoURI: t.logo_uri || "",
+      price: t.price ?? 0,
+      marketcap: t.market_cap ?? 0,
+      liquidity: t.liquidity ?? 0,
+      volume24h: t.volume_24h_usd ?? 0,
+      priceChange24h: t.price_change_24h_percent ?? 0,
+      holders: t.holder ?? 0,
+      top10HolderPercent: null,   // not available from meme/list
+      launchedAt: t.listing_time ? new Date(t.listing_time * 1000) : null,
+      updated_at: new Date()
+    }));
+
+    res.json({ round_date: today, tokens });
   } catch (e) {
     console.error("Error fetching round:", e);
     res.status(500).json({ error: "Failed to fetch round" });
   }
 });
+
+
 
 // ---------- READ: one token snapshot ----------
 app.get("/tokens/:address", async (req, res) => {
