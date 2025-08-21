@@ -372,165 +372,207 @@ app.post("/cron/fetch-tokens", async (req, res) => {
 });
 
 
+// ---------- Calculate PnL for a play ----------
+async function calculatePnL(selections, round) {
+  let totalPnl = 0;
+  let counted = 0;
+
+  for (const pick of selections) {
+    const address = pick.address;
+    const choice = pick.choice; // "long" or "short"
+
+    // Fetch start and end prices from token_history
+    const { rows: hist } = await pool.query(
+      `select price, ts
+       from token_history
+       where token_address = $1
+         and ts between $2 and $3
+       order by ts asc`,
+      [address, round.round_start, round.round_end]
+    );
+
+    if (hist.length < 2) continue; // no enough data
+
+    const startPrice = parseFloat(hist[0].price);
+    const endPrice = parseFloat(hist[hist.length - 1].price);
+    if (!startPrice || !endPrice) continue;
+
+    let pnl = 0;
+    if (choice === "long") {
+      pnl = ((endPrice - startPrice) / startPrice) * 100;
+    } else if (choice === "short") {
+      pnl = ((startPrice - endPrice) / startPrice) * 100;
+    }
+
+    totalPnl += pnl;
+    counted++;
+  }
+
+  if (counted === 0) return 0;
+  return totalPnl / counted; // average % pnl
+}
+
+
+
+async function startNewRound() {
+  const now = new Date();
+  const start = new Date(Math.floor(now.getTime() / (10 * 60 * 1000)) * (10 * 60 * 1000));
+  const end = new Date(start.getTime() + 10 * 60 * 1000);
+
+  // Load today's token list
+  const today = new Date().toISOString().slice(0, 10);
+  const { rows } = await pool.query(
+    `select tokens from daily_token_lists where round_date = $1 limit 1`,
+    [today]
+  );
+  if (!rows.length) throw new Error("No daily tokens found for today");
+
+  // Pick 5 random tokens
+  const tokenList = rows[0].tokens;
+  const shuffled = tokenList.sort(() => 0.5 - Math.random());
+  const selected = shuffled.slice(0, 5);
+
+  // Save new round
+  const { rows: inserted } = await pool.query(
+    `insert into rounds (round_start, round_end, tokens)
+     values ($1, $2, $3)
+     returning id, round_start, round_end`,
+    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+  );
+
+  // Broadcast to all Telegram users
+  const { rows: users } = await pool.query(`select chat_id from telegram_users`);
+  for (const u of users) {
+    try {
+      await tgApi("sendMessage", {
+        chat_id: u.chat_id,
+        text: `🚀 New round has started!\nYou have 10 minutes to play.\n\nTap to join:`,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }
+          ]]
+        }
+      });
+    } catch (e) {
+      console.error("Failed to notify user", u.chat_id, e.message);
+    }
+  }
+
+  return inserted[0];
+}
+async function finishRound(round) {
+  // Fetch all plays for this round
+  const { rows: plays } = await pool.query(
+    `select p.id, p.user_id, p.selections, u.username
+     from plays p
+     join users u on u.id = p.user_id
+     where p.round_id = $1`,
+    [round.id]
+  );
+
+for (const play of plays) {
+  const selections = play.selections;
+  const pnl = await calculatePnL(selections, round);
+
+  await pool.query(
+    `insert into round_results (round_id, user_id, selections, pnl)
+     values ($1, $2, $3, $4)
+     on conflict (round_id, user_id) do update
+     set selections = excluded.selections, pnl = excluded.pnl`,
+    [round.id, play.user_id, JSON.stringify(selections), pnl]
+  );
+}
+
+
+  // Build leaderboard text
+  const leaderboard = await buildLeaderboard(round.id);
+
+  // Send to all Telegram users
+  const { rows: users } = await pool.query(`select chat_id from telegram_users`);
+  for (const u of users) {
+    try {
+      await tgApi("sendMessage", {
+        chat_id: u.chat_id,
+        text: `⏳ Round ended!\n\n${leaderboard}`
+      });
+    } catch (e) {
+      console.error("Failed to send round end to", u.chat_id, e.message);
+    }
+  }
+
+  await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
+}
+
+
+
 // ---------- Build leaderboard for a finished round ----------
 async function buildLeaderboard(roundId) {
-  // Get all results for that round
   const { rows } = await pool.query(
-    `select r.chat_id, r.pnl, r.choices, u.chat_id as id
+    `select u.username, r.pnl
      from round_results r
-     join telegram_users u on u.chat_id = r.chat_id
+     join users u on u.id = r.user_id
      where r.round_id = $1
-     order by r.pnl desc`,
+     order by r.pnl desc
+     limit 10`,
     [roundId]
   );
 
-  if (!rows.length) return "No results for this round 🤷";
+  if (!rows.length) return "No results yet.";
 
-  let text = "🏆 Round Leaderboard 🏆\n\n";
+  let text = "🏆 Leaderboard\n\n";
   rows.forEach((row, i) => {
-    text += `${i + 1}. User ${row.chat_id}\n   📈 PnL: ${row.pnl.toFixed(2)}%\n`;
+    text += `${i + 1}. ${row.username || "Anon"} — ${row.pnl.toFixed(2)}%\n`;
   });
   return text;
 }
 
-// ---------- CRON: send round results ----------
-app.post("/cron/round-results", async (req, res) => {
+
+
+// ---------- CRON: manage rounds ----------
+app.post("/cron/manage-rounds", async (req, res) => {
   try {
-    const hdr = req.get("x-cron-secret");
-    if (CRON_SECRET && hdr !== CRON_SECRET) {
-      return res.status(401).json({ error: "unauthorized" });
+    if (!CRON_SECRET || req.headers["x-cron-secret"] !== CRON_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    // 1. Find the last finished round that hasn't had results sent
-    const { rows } = await pool.query(
-      `select * from rounds
-       where round_end < now() and coalesce(results_sent, false) = false
-       order by round_end desc
-       limit 1`
+    const now = new Date();
+
+    // 1. Check if there is an active round
+    const { rows: active } = await pool.query(
+      `select * from rounds where round_start <= $1 and round_end > $1 limit 1`,
+      [now.toISOString()]
     );
 
-    if (!rows.length) {
-      return res.json({ ok: true, message: "No finished rounds yet" });
+    if (!active.length) {
+      // No active round → start one
+      const round = await startNewRound();
+      return res.json({ ok: true, action: "started", round });
     }
 
-    const round = rows[0];
+    const currentRound = active[0];
 
-    // 2. Build leaderboard text
-    const leaderboard = await buildLeaderboard(round.id);
-
-    // 3. Load all telegram users
-    const { rows: users } = await pool.query(
-      `select chat_id from telegram_users`
+    // 2. Check if any round just ended and results not sent
+    const { rows: finished } = await pool.query(
+      `select * from rounds 
+       where round_end <= $1 and coalesce(results_sent, false) = false
+       order by round_end asc`,
+      [now.toISOString()]
     );
 
-    // 4. Send leaderboard to each user
-    for (const u of users) {
-      try {
-        await tgApi("sendMessage", {
-          chat_id: u.chat_id,
-          text: leaderboard
-        });
-      } catch (e) {
-        console.error("Failed to send to", u.chat_id, e.message);
+    if (finished.length) {
+      for (const r of finished) {
+        await finishRound(r);
       }
+      return res.json({ ok: true, action: "finished", count: finished.length });
     }
 
-    // 5. Mark round as results_sent
-    await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
-
-    res.json({ ok: true, message: "Round results sent", round_id: round.id, sent_to: users.length });
+    res.json({ ok: true, action: "idle" });
   } catch (e) {
-    console.error("cron/round-results error:", e);
-    res.status(500).json({ error: "failed to send round results" });
+    console.error("manage-rounds error:", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-
-
-// ---------- SAVE PLAYER RESULT + SEND TG MESSAGE ----------
-app.post("/results/submit", async (req, res) => {
- try {
-   const { playId } = req.body;
-   if (!playId) {
-     return res.status(400).json({ error: "Missing playId" });
-   }
-
-   // Load the play
-   const { rows: plays } = await pool.query("SELECT * FROM plays WHERE id=$1", [playId]);
-   if (!plays.length) {
-     return res.status(404).json({ error: "Play not found" });
-   }
-   const play = plays[0];
-   const selections = play.selections || [];
-   const timestamp = play.timestamp;
-
-   // Get current round
-   const round = await getCurrentRound();
-   if (!round) {
-     return res.status(400).json({ error: "No active round" });
-   }
-
-   // Calculate PnL (same logic as leaderboard)
-   let totalPnl = 0;
-   let count = 0;
-
-   for (const sel of selections) {
-     const { address, direction } = sel;
-     if (!address) continue;
-
-     // Entry price = closest snapshot <= play.timestamp
-     const entryQ = await pool.query(
-       `select price from token_history
-        where address=$1 and ts <= $2
-        order by ts desc limit 1`,
-       [address, timestamp]
-     );
-
-     // Exit price = most recent snapshot
-     const exitQ = await pool.query(
-       `select price from token_history
-        where address=$1
-        order by ts desc limit 1`,
-       [address]
-     );
-
-     if (entryQ.rows.length && exitQ.rows.length) {
-       let pnl = ((exitQ.rows[0].price - entryQ.rows[0].price) / entryQ.rows[0].price) * 100;
-       if (direction === "short") pnl *= -1;
-       totalPnl += pnl;
-       count++;
-     }
-   }
-
-   const avgPnl = count ? totalPnl / count : 0;
-
-   // Save to round_results table
-   await pool.query(
-     `INSERT INTO round_results (round_id, chat_id, portfolio, pnl, choices)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (round_id, chat_id) DO UPDATE SET
-      portfolio = excluded.portfolio,
-      pnl = excluded.pnl,
-      choices = excluded.choices`,
-     [round.id, play.user_id, JSON.stringify(selections), avgPnl, JSON.stringify(selections)]
-   );
-
-   // Build TG message
-   let text = `📊 Your round is locked!\n\nPnL: ${avgPnl.toFixed(2)}%\n\n`;
-   text += selections.map(s => `${s.symbol} ${s.direction.toUpperCase()}`).join("\n");
-
-   // Send to Telegram user
-   await tgApi("sendMessage", {
-     chat_id: play.user_id,
-     text
-   });
-
-   res.json({ ok: true, pnl: avgPnl });
- } catch (e) {
-   console.error("Error in /results/submit:", e);
-   res.status(500).json({ error: "Failed to compute/submit result" });
- }
-});
 
 
 
@@ -748,41 +790,23 @@ app.get("/tokens/:address/history", async (req, res) => {
 // ------ Save a play (user's selections) ----------
 app.post("/plays", async (req, res) => {
   try {
+    const user = await getUserFromTelegram(req); // auth
     const { selections } = req.body;
-    
-    // Log the incoming headers to debug the initData
-    console.log("--- /plays Request Log ---");
-    console.log("Received X-Telegram-InitData:", req.get('X-Telegram-InitData'));
-    console.log("Received X-Telegram-InitDataUnsafe:", req.get('X-Telegram-InitDataUnsafe'));
-    console.log("Backend-parsed Telegram user (should not be null):", req.tgUser);
-    console.log("----------------------------------");
 
-    if (!req.tgUser) {
-      return res.status(401).json({ ok: false, error: "Unauthorized: Telegram user not found in request" });
-    }
-
-    if (!selections || !Array.isArray(selections)) {
-      return res.status(400).json({ ok: false, error: "Invalid selections data" });
-    }
-
-    // Prepare data for the database
-    const playId = crypto.randomUUID();
-    const userId = req.tgUser.id.toString();
-    const username = req.tgUser.username || req.tgUser.first_name || `user-${userId}`;
-    const timestamp = new Date();
-
-    // Store the play in the database
-    await pool.query(
-      "INSERT INTO plays (id, user_id, username, timestamp, selections) VALUES ($1, $2, $3, $4, $5)",
-      [playId, userId, username, timestamp, JSON.stringify(selections)]
+    const { rows } = await pool.query(
+      `insert into plays (user_id, round_id, selections)
+       values ($1, (select id from rounds order by round_start desc limit 1), $2)
+       returning id`,
+      [user.id, JSON.stringify(selections)]
     );
 
-    res.json({ ok: true, message: "Play saved successfully", playId });
+    res.json({ ok: true, playId: rows[0].id });
   } catch (e) {
-    console.error("/plays error:", e);
-    res.status(500).json({ ok: false, error: "Internal Server Error" });
+    console.error("plays error", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 // ---------- READ: leaderboard (24h cycle, ranked by PnL) ----------
