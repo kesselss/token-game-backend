@@ -463,36 +463,78 @@ async function startNewRound() {
 
 
 // ---------- Finish Round ----------
+// === FINISH A ROUND ===
 async function finishRound(round) {
-  // Fetch all plays for this round
-  const { rows: plays } = await pool.query(
-  `select p.id, p.user_id, p.username, p.selections, t.chat_id
-   from plays p
-   join telegram_users t on t.user_id::text = p.user_id::text
-   where p.timestamp between $1 and $2`,
-  [round.round_start, round.round_end]
-);
+  try {
+    console.log(`⚡ Finishing round ${round.id}`);
 
+    // fetch all plays tied to this round
+    const { rows: plays } = await pool.query(
+      `SELECT p.id, p.round_id, p.user_id, p.username, p.selections, t.chat_id
+       FROM plays p
+       JOIN telegram_users t ON t.user_id::text = p.user_id::text
+       WHERE p.round_id = $1`,
+      [round.id]
+    );
 
-  for (const play of plays) {
-    // Compute PnL from selections vs token history
-    const pnl = await calculatePnL(play.selections, round);
+    if (!plays.length) {
+      console.log("No plays found for this round.");
+      return;
+    }
 
-    // Save into round_results (chat_id-based schema)
-await pool.query(
-  `insert into round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
-   values ($1, $2, $3, $4, $5, $6)
-   on conflict (round_id, user_id) do update
-   set portfolio = excluded.portfolio, pnl = excluded.pnl, choices = excluded.choices`,
-  [
-    round.id,
-    play.user_id,
-    play.chat_id,
-    JSON.stringify(play.selections),
-    pnl,
-    JSON.stringify(play.selections)
-  ]
-);
+    // calculate PnL for each play (stub: replace with your logic)
+    for (const play of plays) {
+      const pnl = Math.floor(Math.random() * 200 - 100); // example: random -100..+100
+
+      await pool.query(
+        `INSERT INTO round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (round_id, user_id) DO UPDATE
+         SET portfolio = EXCLUDED.portfolio,
+             pnl = EXCLUDED.pnl,
+             choices = EXCLUDED.choices`,
+        [
+          round.id,
+          play.user_id,
+          play.chat_id,
+          JSON.stringify(play.selections),
+          pnl,
+          JSON.stringify(play.selections)
+        ]
+      );
+    }
+
+    console.log(`✅ Round ${round.id} finished and results saved.`);
+
+    // Optionally: build leaderboard and send to Telegram
+    const { rows: leaderboard } = await pool.query(
+      `SELECT t.username, r.pnl
+       FROM round_results r
+       JOIN telegram_users t ON t.user_id::text = r.user_id::text
+       WHERE r.round_id = $1
+       ORDER BY r.pnl DESC
+       LIMIT 10`,
+      [round.id]
+    );
+
+    let message = `🏆 Round ${round.id} Results 🏆\n\n`;
+    leaderboard.forEach((row, i) => {
+      message += `${i + 1}. ${row.username} — ${row.pnl}\n`;
+    });
+
+    // broadcast results to all players in this round
+    for (const play of plays) {
+      await tgApi("sendMessage", {
+        chat_id: play.chat_id,
+        text: message
+      });
+    }
+
+  } catch (err) {
+    console.error("❌ Error finishing round:", err);
+  }
+}
+
 
   }
 
@@ -815,23 +857,34 @@ app.get("/tokens/:address/history", async (req, res) => {
 // ---------- WRITE: submit a play (with debug logs) ----------
 // ------ Save a play (user's selections) ----------
 // ---------- Save Player's Play ----------
+// === SAVE A PLAY ===
 app.post("/plays", async (req, res) => {
   try {
-    const body = req.body;
-    const id = crypto.randomUUID();
+    const { user_id, username, selections } = req.body;
 
+    // fetch current round
+    const { rows: [round] } = await pool.query(
+      "SELECT id FROM rounds WHERE round_end > now() ORDER BY round_start LIMIT 1"
+    );
+    if (!round) {
+      return res.status(400).json({ ok: false, error: "No active round" });
+    }
+
+    const playId = crypto.randomUUID();
     await pool.query(
-      `insert into plays (id, user_id, username, selections)
-       values ($1, $2, $3, $4)`,
-      [id, body.user_id.toString(), body.username, JSON.stringify(body.selections)]
+      `INSERT INTO plays (id, round_id, user_id, chat_id, username, selections)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [playId, round.id, user_id, req.tgUser?.id || null, username, JSON.stringify(selections)]
     );
 
-    res.json({ ok: true, playId: id });
-  } catch (e) {
-    console.error("plays error", e);
-    res.status(500).json({ ok: false, error: e.message });
+    res.json({ ok: true, playId });
+  } catch (err) {
+    console.error("plays error", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+
 
 
 
