@@ -538,9 +538,6 @@ async function finishRound(round) {
 
   
 
-  // Build leaderboard text
-  const leaderboard = await buildLeaderboard(round.id);
-
   // Send to all Telegram users
   const { rows: users } = await pool.query(`select chat_id from telegram_users`);
   for (const u of users) {
