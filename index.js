@@ -455,9 +455,9 @@ async function finishRound(round) {
   try {
     console.log(`⚡ Finishing round ${round.id}`);
 
-    // fetch all plays tied to this round
+    // 1. Fetch all plays for this round (chat_id comes directly from plays)
     const { rows: plays } = await pool.query(
-      `SELECT p.id, p.round_id, p.user_id, p.username, p.selections, t.chat_id
+      `SELECT p.id, p.round_id, p.user_id, p.username, p.selections, p.chat_id
        FROM plays p
        WHERE p.round_id = $1`,
       [round.id]
@@ -465,16 +465,13 @@ async function finishRound(round) {
 
     if (!plays.length) {
       console.log("No plays found for this round.");
-      // Still mark as sent to prevent retrying
-      await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
+      await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
       return;
     }
 
-    // calculate PnL for each play
+    // 2. Calculate PnL (stubbed random here, replace with your calculatePnL)
     for (const play of plays) {
-      // NOTE: Using your actual calculatePnL function would be better here.
-      // The original code used a random number, which is kept for consistency.
-      const pnl = Math.floor(Math.random() * 200 - 100); 
+      const pnl = Math.floor(Math.random() * 200 - 100); // -100% .. +100%
 
       await pool.query(
         `INSERT INTO round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
@@ -496,11 +493,11 @@ async function finishRound(round) {
 
     console.log(`✅ Round ${round.id} finished and results saved.`);
 
-    // Build leaderboard and send to Telegram
+    // 3. Build leaderboard for this round
     const { rows: leaderboard } = await pool.query(
-      `SELECT t.username, r.pnl
+      `SELECT COALESCE(t.username, r.user_id::text) AS username, r.pnl
        FROM round_results r
-       JOIN telegram_users t ON t.user_id::text = r.user_id::text
+       LEFT JOIN telegram_users t ON t.user_id::text = r.user_id::text
        WHERE r.round_id = $1
        ORDER BY r.pnl DESC
        LIMIT 10`,
@@ -512,7 +509,7 @@ async function finishRound(round) {
       message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
-    // Broadcast results to all players in this round
+    // 4. Send results to every participant of this round
     for (const play of plays) {
       await tgApi("sendMessage", {
         chat_id: play.chat_id,
@@ -520,13 +517,14 @@ async function finishRound(round) {
       });
     }
 
-    // *** FIX: Mark results as sent AFTER sending them ***
-    await pool.query(`update rounds set results_sent = true where id = $1`, [round.id]);
+    // 5. Mark round as finished
+    await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
 
   } catch (err) {
     console.error("❌ Error finishing round:", err);
   }
 }
+
 
 
 // ---------- Build Leaderboard ----------
