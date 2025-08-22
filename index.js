@@ -374,43 +374,30 @@ app.post("/cron/fetch-tokens", async (req, res) => {
 
 // ---------- Calculate PnL for a play ----------
 async function calculatePnL(selections, round) {
-  let totalPnl = 0;
-  let counted = 0;
+  let total = 0, n = 0;
 
   for (const pick of selections) {
-    const address = pick.address;
-    const choice = pick.choice; // "long" or "short"
-
-    // Fetch start and end prices from token_history
+    const { address, direction } = pick; // "long" | "short"
     const { rows: hist } = await pool.query(
       `select price, ts
        from token_history
-       where token_address = $1
+       where address = $1
          and ts between $2 and $3
        order by ts asc`,
       [address, round.round_start, round.round_end]
     );
 
-    if (hist.length < 2) continue; // no enough data
+    if (hist.length < 2) continue;
+    const start = Number(hist[0].price), end = Number(hist[hist.length - 1].price);
+    if (!start || !end) continue;
 
-    const startPrice = parseFloat(hist[0].price);
-    const endPrice = parseFloat(hist[hist.length - 1].price);
-    if (!startPrice || !endPrice) continue;
-
-    let pnl = 0;
-    if (choice === "long") {
-      pnl = ((endPrice - startPrice) / startPrice) * 100;
-    } else if (choice === "short") {
-      pnl = ((startPrice - endPrice) / startPrice) * 100;
-    }
-
-    totalPnl += pnl;
-    counted++;
+    const move = (end - start) / start * 100;
+    total += direction === "short" ? -move : move;
+    n++;
   }
-
-  if (counted === 0) return 0;
-  return totalPnl / counted; // average % pnl
+  return n ? total / n : 0;
 }
+
 
 
 
@@ -472,7 +459,6 @@ async function finishRound(round) {
     const { rows: plays } = await pool.query(
       `SELECT p.id, p.round_id, p.user_id, p.username, p.selections, t.chat_id
        FROM plays p
-       JOIN telegram_users t ON t.user_id::text = p.user_id::text
        WHERE p.round_id = $1`,
       [round.id]
     );
