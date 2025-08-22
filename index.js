@@ -232,7 +232,7 @@ async function fetchTokenSnapshot(address) {
 async function fetchHistoryPoints(address) {
   const now = Math.floor(Date.now() / 1000);
   const oneDayAgo = now - 24 * 60 * 60;
-  const url = `https://public-api.birdeye.so/defi/history_price?address=${address}&address_type=token&type=30m&time_from=${oneDayAgo}&time_to=${now}&ui_amount_mode=raw`;
+  const url = `https://public-api.birdeye.so/defi/history_price?address=${address}&address_type=token&type=1m&time_from=${oneDayAgo}&time_to=${now}&ui_amount_mode=raw`;
   const json = await beJson(url);
   const items = json?.data?.items || [];
   return items
