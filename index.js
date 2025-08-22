@@ -398,6 +398,31 @@ async function calculatePnL(selections, round) {
   return n ? total / n : 0;
 }
 
+// ---------- Update live PnL for an active round ----------
+async function updateLivePnL(round) {
+  // fetch all plays in this round
+  const { rows: plays } = await pool.query(
+    `SELECT id, user_id, chat_id, selections
+     FROM plays
+     WHERE round_id = $1`,
+    [round.id]
+  );
+
+  for (const play of plays) {
+    // calculate using your real calculatePnL
+    const pnl = await calculatePnL(play.selections, round);
+
+    await pool.query(
+      `INSERT INTO live_pnl (round_id, user_id, pnl)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (round_id, user_id)
+       DO UPDATE SET pnl = EXCLUDED.pnl, last_updated = now()`,
+      [round.id, play.user_id, pnl]
+    );
+  }
+
+  console.log(`📊 Updated live PnL for round ${round.id}`);
+}
 
 
 
@@ -449,7 +474,6 @@ async function startNewRound() {
 }
 
 
-// ---------- Finish Round ----------
 // === FINISH A ROUND ===
 async function finishRound(round) {
   try {
@@ -466,12 +490,14 @@ async function finishRound(round) {
     if (!plays.length) {
       console.log("No plays found for this round.");
       await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
+      // Clean up any leftover live_pnl just in case
+      await pool.query(`DELETE FROM live_pnl WHERE round_id = $1`, [round.id]);
       return;
     }
 
-    // 2. Calculate PnL (stubbed random here, replace with your calculatePnL)
+    // 2. Calculate final PnL for each play
     for (const play of plays) {
-      const pnl = Math.floor(Math.random() * 200 - 100); // -100% .. +100%
+      const pnl = await calculatePnL(play.selections, round);
 
       await pool.query(
         `INSERT INTO round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
@@ -520,10 +546,15 @@ async function finishRound(round) {
     // 5. Mark round as finished
     await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
 
+    // 6. Clean up live_pnl for this round
+    await pool.query(`DELETE FROM live_pnl WHERE round_id = $1`, [round.id]);
+    console.log(`🧹 Cleaned up live PnL for round ${round.id}`);
+
   } catch (err) {
     console.error("❌ Error finishing round:", err);
   }
 }
+
 
 
 
@@ -593,7 +624,10 @@ app.post("/cron/manage-rounds", async (req, res) => {
       return res.json({ ok: true, action: "finished", count: finished.length });
     }
 
-    res.json({ ok: true, action: "idle" });
+    // 3. Otherwise update live pnl for the current active round
+    await updateLivePnL(currentRound);
+    return res.json({ ok: true, action: "live-updated", round: currentRound.id });
+
   } catch (e) {
     console.error("manage-rounds error:", e);
     res.status(500).json({ ok: false, error: e.message });
@@ -603,12 +637,14 @@ app.post("/cron/manage-rounds", async (req, res) => {
 
 
 
-// ---------- Telegram Webhook ----------
+
 // ---------- Telegram Webhook ----------
 app.post("/telegram/webhook", async (req, res) => {
   try {
     // Verify Telegram's secret token (set when you called setWebhook)
-    const hdr = req.get("x-telegram-bot-api-secret-token") || req.get("X-Telegram-Bot-Api-Secret-Token");
+    const hdr =
+      req.get("x-telegram-bot-api-secret-token") ||
+      req.get("X-Telegram-Bot-Api-Secret-Token");
     if (TELEGRAM_WEBHOOK_SECRET && hdr !== TELEGRAM_WEBHOOK_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
@@ -648,9 +684,7 @@ app.post("/telegram/webhook", async (req, res) => {
         chat_id,
         text: "🚀 Meme Draft is ready. Tap to play:",
         reply_markup: {
-          inline_keyboard: [[
-            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
-          ]]
+          inline_keyboard: [[{ text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }]]
         }
       });
     }
@@ -678,6 +712,57 @@ app.post("/telegram/webhook", async (req, res) => {
       }
     }
 
+    // Handle /live
+    if (msg?.text?.startsWith("/live")) {
+      const chat_id = msg.chat.id;
+      const round = await getCurrentRound();
+
+      if (!round) {
+        await tgApi("sendMessage", {
+          chat_id,
+          text: "⏳ No active round right now. A new one will start soon!"
+        });
+      } else {
+        // 🟢 Small polish: guard against showing standings if round already ended
+        if (new Date(round.round_end) <= new Date()) {
+          await tgApi("sendMessage", {
+            chat_id,
+            text: "⏳ This round has already ended. Wait for the next one!"
+          });
+        } else {
+          const { rows } = await pool.query(
+            `select coalesce(t.username, l.user_id::text) as username,
+                    l.pnl
+             from live_pnl l
+             left join telegram_users t on t.user_id::text = l.user_id::text
+             where l.round_id = $1
+             order by l.pnl desc
+             limit 10`,
+            [round.id]
+          );
+
+          if (!rows.length) {
+            await tgApi("sendMessage", {
+              chat_id,
+              text: "No plays yet this round."
+            });
+          } else {
+            let message = `📊 Live Standings (Round ends at ${new Date(
+              round.round_end
+            ).toLocaleTimeString()})\n\n`;
+            rows.forEach((row, i) => {
+              message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
+            });
+
+            await tgApi("sendMessage", {
+              chat_id,
+              text: message
+            });
+          }
+        }
+      }
+    }
+
     // Acknowledge update
     res.json({ ok: true });
   } catch (e) {
@@ -685,6 +770,7 @@ app.post("/telegram/webhook", async (req, res) => {
     res.status(200).json({ ok: true }); // don't retry forever
   }
 });
+
 
 
 
@@ -903,6 +989,29 @@ app.get("/leaderboard", async (req, res) => {
 });
 
 
+// ---------- READ: live PnL for a round ----------
+app.get("/rounds/:id/live-pnl", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `select l.user_id,
+              coalesce(t.username, l.user_id::text) as username,
+              l.pnl,
+              l.last_updated
+       from live_pnl l
+       left join telegram_users t on t.user_id::text = l.user_id::text
+       where l.round_id = $1
+       order by l.pnl desc`,
+      [id]
+    );
+
+    res.json({ ok: true, live: rows });
+  } catch (e) {
+    console.error("live-pnl error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 
 
