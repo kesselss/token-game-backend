@@ -698,10 +698,10 @@ app.post("/telegram/webhook", async (req, res) => {
       const chat_id = msg.chat.id;
       await tgApi("sendMessage", {
         chat_id,
-        text: "🚀 Meme Draft is ready. Tap to play:",
+        text: "🚀 Degendle is ready. Tap to play:",
         reply_markup: {
           inline_keyboard: [[
-            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
+            { text: "🚀 Play Degendle", web_app: { url: FRONTEND_URL } }
           ]]
         }
       });
