@@ -673,8 +673,6 @@ app.post("/telegram/webhook", async (req, res) => {
       } catch (dbErr) {
         console.error("❌ Failed to save Telegram user:", dbErr);
       }
-
-      console.log("Incoming chat:", msg.chat);
     }
 
     // Handle /start
@@ -684,7 +682,9 @@ app.post("/telegram/webhook", async (req, res) => {
         chat_id,
         text: "🚀 Meme Draft is ready. Tap to play:",
         reply_markup: {
-          inline_keyboard: [[{ text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }]]
+          inline_keyboard: [[
+            { text: "🚀 Play Meme Draft", web_app: { url: FRONTEND_URL } }
+          ]]
         }
       });
     }
@@ -723,42 +723,89 @@ app.post("/telegram/webhook", async (req, res) => {
           text: "⏳ No active round right now. A new one will start soon!"
         });
       } else {
-        // 🟢 Small polish: guard against showing standings if round already ended
-        if (new Date(round.round_end) <= new Date()) {
+        const { rows } = await pool.query(
+          `select coalesce(t.username, l.user_id::text) as username,
+                  l.pnl
+           from live_pnl l
+           left join telegram_users t on t.user_id::text = l.user_id::text
+           where l.round_id = $1
+           order by l.pnl desc
+           limit 10`,
+          [round.id]
+        );
+
+        if (!rows.length) {
           await tgApi("sendMessage", {
             chat_id,
-            text: "⏳ This round has already ended. Wait for the next one!"
+            text: "No plays yet this round."
           });
         } else {
-          const { rows } = await pool.query(
-            `select coalesce(t.username, l.user_id::text) as username,
-                    l.pnl
-             from live_pnl l
-             left join telegram_users t on t.user_id::text = l.user_id::text
-             where l.round_id = $1
-             order by l.pnl desc
-             limit 10`,
-            [round.id]
-          );
+          let message = `📊 Live Standings (Round ends at ${new Date(
+            round.round_end
+          ).toLocaleTimeString()})\n\n`;
+          rows.forEach((row, i) => {
+            message += `${i + 1}. ${row.username} — ${parseFloat(
+              row.pnl
+            ).toFixed(2)}%\n`;
+          });
 
-          if (!rows.length) {
-            await tgApi("sendMessage", {
-              chat_id,
-              text: "No plays yet this round."
-            });
-          } else {
-            let message = `📊 Live Standings (Round ends at ${new Date(
-              round.round_end
-            ).toLocaleTimeString()})\n\n`;
-            rows.forEach((row, i) => {
-              message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
-            });
+          await tgApi("sendMessage", {
+            chat_id,
+            text: message
+          });
+        }
+      }
+    }
 
-            await tgApi("sendMessage", {
-              chat_id,
-              text: message
-            });
-          }
+    // Handle /leaderboard
+    if (msg?.text?.startsWith("/leaderboard")) {
+      const chat_id = msg.chat.id;
+
+      // Get most recent finished round
+      const { rows: lastRound } = await pool.query(
+        `select * from rounds 
+         where results_sent = true 
+         order by round_end desc 
+         limit 1`
+      );
+
+      if (!lastRound.length) {
+        await tgApi("sendMessage", {
+          chat_id,
+          text: "No finished rounds yet."
+        });
+      } else {
+        const round = lastRound[0];
+        const { rows } = await pool.query(
+          `select coalesce(t.username, r.user_id::text) as username,
+                  r.pnl
+           from round_results r
+           left join telegram_users t on t.user_id::text = r.user_id::text
+           where r.round_id = $1
+           order by r.pnl desc
+           limit 10`,
+          [round.id]
+        );
+
+        if (!rows.length) {
+          await tgApi("sendMessage", {
+            chat_id,
+            text: "No results for that round."
+          });
+        } else {
+          let message = `🏆 Leaderboard (Round ended at ${new Date(
+            round.round_end
+          ).toLocaleTimeString()})\n\n`;
+          rows.forEach((row, i) => {
+            message += `${i + 1}. ${row.username} — ${parseFloat(
+              row.pnl
+            ).toFixed(2)}%\n`;
+          });
+
+          await tgApi("sendMessage", {
+            chat_id,
+            text: message
+          });
         }
       }
     }
@@ -770,6 +817,7 @@ app.post("/telegram/webhook", async (req, res) => {
     res.status(200).json({ ok: true }); // don't retry forever
   }
 });
+
 
 
 
