@@ -14,8 +14,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
-// Allow your Netlify site (adjust as needed)
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://charming-dieffenbachia-a9e8f1.netlify.app";
 
 // ---------- Telegram constants & helper ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
@@ -131,15 +129,35 @@ app.use(telegramAuth);
 
 
 
+const ALLOWED_ORIGINS = [
+  "https://degendle.com",
+  "https://charming-dieffenbachia-a9e8f1.netlify.app"
+];
+
 // --- CORS ---
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
+    origin: function (origin, callback) {
+      // Allow server-to-server, or if origin is in allowed list
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS: " + origin));
+      }
+    },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-cron-secret", "X-Telegram-InitData", "x-telegram-initdata"]
+    allowedHeaders: [
+      "Content-Type",
+      "x-cron-secret",
+      "X-Telegram-InitData",
+      "x-telegram-initdata"
+    ]
   })
 );
+
+// Optional fallback for preflight requests
 app.options("*", cors());
+
 
 
 // ---------- Allowlist of token addresses you want to track ----------
