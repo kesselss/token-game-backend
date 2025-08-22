@@ -783,7 +783,7 @@ app.post("/telegram/webhook", async (req, res) => {
 async function createNewRound() {
   const now = new Date();
   // Align start time to the current 10-minute block
-  const start = new Date(Math.floor(now.getTime() / (15 * 60 * 1000)) * (15 * 60 * 1000));
+  const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
   const end = new Date(start.getTime() + 10 * 60 * 1000);
 
   // 1. Load today’s token list from daily_token_lists
