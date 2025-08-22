@@ -131,6 +131,7 @@ app.use(telegramAuth);
 
 const ALLOWED_ORIGINS = [
   "https://degendle.com",
+  "https://degendle.com/daily-game",
   "https://charming-dieffenbachia-a9e8f1.netlify.app"
 ];
 
