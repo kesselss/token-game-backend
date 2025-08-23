@@ -5,7 +5,7 @@ import fetch from "node-fetch";
 import pkg from "pg";
 import crypto from "crypto";
 
-const { Pool } = pkg;
+const { Pool } = pkg; //s
 
 // ---------- ENV ----------
 dotenv.config();
@@ -15,13 +15,14 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 const PLAY_URL = "https://degendle.com/daily-game/";
 
+const { generatePnLCard } = require("./pnlCard"); // top of file
+
+
 
 // ---------- Telegram constants & helper ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || FRONTEND_ORIGIN; // fallback
-
-const { generatePnLCard } = require("./pnlCard"); // top of file
 
 
 // ---------- DB ----------OKay 
@@ -29,7 +30,6 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
-
 
 async function tgApi(method, payload) {
   if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
@@ -92,6 +92,25 @@ function verifyTelegramInitData(botToken, telegramInitData) {
 }
 
 
+// --- TG: send PNG buffer as photo (reply to same message) ---
+import { Blob } from "buffer"; // add at top with other imports
+
+async function tgSendPhotoBuffer(chat_id, pngBuffer, caption, replyToMessageId) {
+  const form = new FormData(); // Node 18+: global
+  form.append("chat_id", String(chat_id));
+  if (caption) form.append("caption", caption);
+  if (replyToMessageId) {
+    form.append("reply_to_message_id", String(replyToMessageId));
+    form.append("allow_sending_without_reply", "true");
+  }
+  form.append("photo", new Blob([pngBuffer], { type: "image/png" }), "pnl.png");
+
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+  const res = await fetch(url, { method: "POST", body: form });
+  const json = await res.json();
+  if (!json.ok) throw new Error(`sendPhoto failed: ${json.description || "unknown"}`);
+  return json.result;
+}
 
 
 
@@ -228,18 +247,6 @@ function seededShuffle(arr, seedStr) {
   }
   return a;
 }
-
-function esc(s){ return String(s ?? "").replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
-const fmtUsd = v => '$' + Number(v ?? 0).toFixed(6);
-const fmtP = v => (v>=0?'+':'') + Number(v ?? 0).toFixed(2) + '%';
-const dirTxt = d => d === 'short' ? '📉 Short' : '📈 Long';
-const pnlBlock = v => v > 0 ? '🟩' : v < 0 ? '🟥' : '⬜';
-function topBadge(rank,total){
-  if(!total || total < 10) return '';                  // hide for tiny samples
-  const pct = Math.max(1, Math.ceil((rank/total)*100));// classic “Top 1% is best”
-  return ` (Top ${pct}%)`;
-}
-
 
 async function beJson(url) {
   const res = await fetch(url, { headers: BE_HEADERS });
@@ -706,6 +713,7 @@ async function startNewRound() {
 
 
 
+// === FINISH A ROUND ===
 async function finishRound(round) {
   try {
     console.log(`⚡ Finishing round ${round.id}`);
@@ -725,23 +733,9 @@ async function finishRound(round) {
       return;
     }
 
-    // --- helpers ---
-    async function getPriceAtOrNear(address, tsIso, preferBefore = true) {
-      const q = preferBefore
-        ? `select price from token_history
-             where address = $1 and ts <= $2
-             order by ts desc limit 1`
-        : `select price from token_history
-             where address = $1 and ts >= $2
-             order by ts asc limit 1`;
-      const { rows } = await pool.query(q, [address, tsIso]);
-      return rows[0]?.price != null ? Number(rows[0].price) : null;
-    }
-    function pickPnlPct(entry, exit, direction) {
-      if (!entry || !exit) return null;
-      const move = (exit - entry) / entry * 100;
-      return direction === "short" ? -move : move;
-    }
+    // --- price helpers + pickPnlPct (unchanged) ---
+    async function getPriceAtOrNear(address, tsIso, preferBefore = true) { /* ... same as you pasted ... */ }
+    function pickPnlPct(entry, exit, direction) { /* ... same as you pasted ... */ }
 
     // 2) For each play: compute per-pick PnL and total; save to round_results
     for (const play of plays) {
@@ -754,7 +748,7 @@ async function finishRound(round) {
         if (!address || !direction) continue;
 
         const entry = await getPriceAtOrNear(address, round.round_start, true);
-        const exit  = await getPriceAtOrNear(address, round.round_end,   false);
+        const exit  = await getPriceAtOrNear(address, round.round_end,   true);
         const pnl   = pickPnlPct(entry, exit, direction);
 
         if (pnl != null) { sum += pnl; n += 1; }
@@ -764,8 +758,8 @@ async function finishRound(round) {
           name: name || null,
           logo: logoURI || null,
           direction,
-          entry: entry ?? null,
-          exit: exit ?? null,
+          entry_price: entry ?? 0,
+          current_price: exit ?? 0,
           pnl: pnl ?? 0
         });
       }
@@ -810,14 +804,13 @@ async function finishRound(round) {
       message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
-    // 4) DM each participant: leaderboard + their personal PnL card
+    // 4) DM each participant: leaderboard + their personal rank + breakdown
     for (const play of plays) {
       if (!play.chat_id) continue;
       const fin = play.__final || { total: 0, rows: [] };
 
-      // rank lookup
-      let rank = 0, totalPlayers = 0;
-      let rankLine = ""; // Add this missing variable declaration
+      // fetch this player’s rank + total
+      let rankLine = "";
       try {
         const { rows: [meRow] } = await pool.query(
           `select r.pnl,
@@ -827,26 +820,13 @@ async function finishRound(round) {
            where r.round_id = $1 and r.user_id::text = $2::text`,
           [round.id, play.user_id]
         );
-
-        if (meRow) { rank = meRow.rank; totalPlayers = meRow.total; }
         if (meRow) {
           const topPct = Math.round((meRow.rank / meRow.total) * 100);
           rankLine = `\n🎯 You: #${meRow.rank}/${meRow.total} — ${parseFloat(meRow.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
         }
-
       } catch (err) {
         console.error("rank lookup error", err);
       }
-
-
-      // 🖼 generate PnL card
-      const buffer = await generatePnLCard({
-        playerName: play.username || "anon",
-        rank,
-        totalPlayers,
-        totalPct: fin.total,
-        selections: fin.rows
-      });
 
       const lines = [
         "🧾 Your Round Breakdown",
@@ -865,18 +845,6 @@ async function finishRound(round) {
         chat_id: play.chat_id,
         text: `${message}${rankLine}\n${lines.join("\n")}`
       });
-
-      // send photo with caption
-      const formData = new FormData();
-      formData.append("chat_id", play.chat_id);
-      formData.append(
-        "caption",
-        `${message}\n🎯 You: #${rank}/${totalPlayers} — ${fin.total.toFixed(2)}%`
-      );
-      formData.append("photo", buffer, { filename: "pnl.png", contentType: "image/png" });
-
-      const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
-      await fetch(url, { method: "POST", body: formData });
     }
 
     // 5) Mark finished + cleanup
@@ -887,6 +855,7 @@ async function finishRound(round) {
     console.error("❌ Error finishing round:", err);
   }
 }
+
 
 
 
@@ -968,6 +937,69 @@ app.post("/cron/manage-rounds", async (req, res) => {
   }
 });
 
+// Build { playerName, rank, totalPlayers, totalPct, selections[], title } for the card
+async function buildLivePnLCardData(round, userId) {
+  // Who + current PnL
+  const { rows: meRow } = await pool.query(
+    `select coalesce(t.username, l.user_id::text) as username, l.pnl
+     from live_pnl l
+     left join telegram_users t on t.user_id::text = l.user_id::text
+     where l.round_id = $1 and l.user_id::text = $2::text
+     limit 1`,
+    [round.id, userId]
+  );
+  const playerName = meRow[0]?.username || `User ${userId}`;
+  const totalPct = Number(meRow[0]?.pnl ?? 0);
+
+  // Rank + total players (live)
+  const { rows: ranks } = await pool.query(
+    `select user_id, pnl,
+            row_number() over(order by pnl desc) as rank,
+            count(*) over() as total
+     from live_pnl
+     where round_id = $1`,
+    [round.id]
+  );
+  const mine = ranks.find(r => r.user_id?.toString() === userId);
+  const rank = mine ? Number(mine.rank) : 0;
+  const totalPlayers = mine ? Number(mine.total) : ranks.length;
+
+  // User selections → decorate with entry/exit/pnl up to NOW
+  let selections = [];
+  const { rows: picks } = await pool.query(
+    `select portfolio from round_results
+     where round_id = $1 and user_id::text = $2::text
+     limit 1`,
+    [round.id, userId]
+  );
+  if (picks.length) {
+    const raw = JSON.parse(picks[0].portfolio || "[]"); // [{address,symbol,name,logoURI,direction}]
+    const addrs = [...new Set(raw.map(s => s.address).filter(Boolean))];
+    if (addrs.length) {
+      const endIso = new Date().toISOString(); // live up-to-now
+      const priceMap = await firstLastPrices(addrs, round.round_start, endIso);
+      const deco = decorateSelectionsWithPnl(raw, priceMap);
+      selections = deco.map(s => ({
+        symbol: s.symbol || "",
+        name: s.name || "",
+        logo: s.logoURI || s.logo || "",
+        direction: s.direction || "long",
+        entry: s.entry ?? null,
+        exit: s.exit ?? null,
+        pnl: typeof s.pnl === "number" ? s.pnl : 0
+      }));
+    }
+  }
+
+  return {
+    playerName,
+    rank,
+    totalPlayers,
+    totalPct,
+    selections,
+    title: "Live PnL"
+  };
+}
 
 
 
@@ -1088,18 +1120,18 @@ Useful commands:
       }
     }
 
-   // Handle /live
+    // Handle /live
 if (msg?.text?.startsWith("/live")) {
   const chat_id = msg.chat.id;
   const userId = msg.from?.id?.toString();
   const round = await getCurrentRound();
 
   if (!round) {
-    await tgApi("sendMessage", { chat_id, text: "⏳ No active round right now." });
+    await tgApi("sendMessage", { chat_id, text: "⏳ No active round right now. A new one will start soon!" });
   } else {
+    // Top 10
     const { rows: top } = await pool.query(
       `select coalesce(t.username, l.user_id::text) as username, l.user_id, l.pnl
-
        from live_pnl l
        left join telegram_users t on t.user_id::text = l.user_id::text
        where l.round_id = $1
@@ -1111,140 +1143,222 @@ if (msg?.text?.startsWith("/live")) {
     if (!top.length) {
       await tgApi("sendMessage", { chat_id, text: "No plays yet this round." });
     } else {
-      let message = `📊 Live Standings (Round ends at ${new Date(
-        round.round_end
-      ).toLocaleTimeString()})\n\n`;
-      top.forEach((row, i) => {
-        message += `${i + 1}. ${row.username} — ${parseFloat(
-          row.pnl
-        ).toFixed(2)}%\n`;
-      });
-
-      await tgApi("sendMessage", {
-        chat_id,
-        text: message
-      });
-    }
-
-    // 2) Personal PnL card for this user
-    const userId = msg.from?.id?.toString();
-    if (userId) {
-      // pull this player’s picks with live pnl detail
-      const { rows: picks } = await pool.query(
-        `select address, symbol, name, logo, direction,
-                entry_price as entry, current_price as exit, pnl
-         from live_pnl_detail
-         where round_id = $1 and user_id::text = $2::text`,
-        [round.id, userId]
+      // Full ranking (for "You:")
+      const { rows: ranked } = await pool.query(
+        `select l.user_id,
+                coalesce(t.username, l.user_id::text) as username,
+                l.pnl,
+                row_number() over(order by l.pnl desc) as rank,
+                count(*) over() as total
+         from live_pnl l
+         left join telegram_users t on t.user_id::text = l.user_id::text
+         where l.round_id = $1
+         order by l.pnl desc`,
+        [round.id]
       );
 
-      if (picks.length) {
-        // also fetch rank/total
-        const { rows: [meRow] } = await pool.query(
-          `select r.pnl,
-                  row_number() over(order by r.pnl desc) as rank,
-                  count(*) over() as total
-           from live_pnl r
-           where r.round_id = $1 and r.user_id::text = $2::text`,
-          [round.id, userId]
-        );
+      let message = `📊 Live Standings (Round ends at ${new Date(round.round_end).toLocaleTimeString()})\n\n`;
+      top.forEach((row, i) => {
+        message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
+      });
 
-        const buffer = await generatePnLCard({
-          playerName: msg.from?.username || msg.from?.first_name || "anon",
-          rank: meRow?.rank || 0,
-          totalPlayers: meRow?.total || 0,
-          totalPct: meRow?.pnl || 0,
-          selections: picks
-        });
+      // Add "You:" line + per-pick breakdown (from live_pnl_detail which updateLivePnL keeps fresh)
+      const me = ranked.find(r => r.user_id?.toString() === userId);
+      if (me) {
+        const topPct = Math.round((me.rank / me.total) * 100);
+        message += `\n🎯 You: #${me.rank}/${me.total} — ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)`;
 
-        // Send image via Telegram sendPhoto
-        const FormData = (await import("form-data")).default;
-        const formData = new FormData();
-        formData.append("chat_id", chat_id);
-        formData.append(
-          "caption",
-          `🎯 Your Live PnL — #${meRow?.rank || 0}/${meRow?.total || 0} (${(meRow?.pnl || 0).toFixed(2)}%)`
-        );
-        formData.append("photo", buffer, { filename: "live_pnl.png", contentType: "image/png" });
+        try {
+          const { rows: picks } = await pool.query(
+            `select symbol, name, direction, entry_price, current_price, pnl
+             from live_pnl_detail
+             where round_id = $1 and user_id::text = $2::text
+             order by pnl desc`,
+            [round.id, userId]
+          );
+          if (picks.length) {
+            message += `\n\n🧾 Your Picks (live)\nToken | Dir | Entry | Now | PnL%\n--------------------------------`;
+            for (const p of picks) {
+              const label = (p.symbol || p.name || "").toUpperCase();
+              const dir = p.direction === 'short' ? 'S' : 'L';
+              message += `\n${label} | ${dir} | $${Number(p.entry_price).toFixed(6)} | $${Number(p.current_price).toFixed(6)} | ${Number(p.pnl).toFixed(2)}%`;
+            }
+          }
+        } catch (e) {
+          console.error("live picks fetch error", e);
+        }
+      }
 
-        const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
-        await fetch(url, { method: "POST", body: formData });
+      await tgApi("sendMessage", { chat_id, text: message });
 
-       }
-     }
-   }
+      // --- ADD: PnL image reply (keep existing text above) ---
+try {
+  const chat_id = msg.chat.id;
+  const userId = msg.from?.id?.toString();
+
+  // If you already have `round` in scope, reuse it. Otherwise fetch it:
+  const roundNow = typeof round !== "undefined" && round ? round : await getCurrentRound();
+  if (!roundNow) {
+    // no active round; nothing to render
+  } else {
+    // 1) Fetch this user’s live rank + total + pnl
+    const { rows: meRows } = await pool.query(
+      `select user_id, pnl,
+              row_number() over(order by pnl desc) as rank,
+              count(*) over() as total
+       from live_pnl
+       where round_id = $1`,
+      [roundNow.id]
+    );
+    const meRow = meRows.find(r => r.user_id?.toString() === userId) || null;
+
+    // 2) Pull this user’s live picks (entry/exit/pnl)
+    const { rows: picks } = await pool.query(
+      `select address, symbol, name, logo, direction,
+              entry_price as entry, current_price as exit, pnl
+       from live_pnl_detail
+       where round_id = $1 and user_id::text = $2::text
+       order by pnl desc
+       limit 6`,
+       [roundNow.id, userId]
+    );
+
+    // 3) Build the image buffer (uses your ES module: generatePnLCard)
+    const buffer = await generatePnLCard({
+      playerName: msg.from?.username || msg.from?.first_name || "anon",
+      rank: meRow?.rank || 0,
+      totalPlayers: meRow?.total || 0,
+      totalPct: Number(meRow?.pnl ?? 0),
+      selections: picks.map(s => ({
+        symbol: s.symbol,
+        name: s.name,
+        logo: s.logo,           // assumes you store a URL in `logo`
+        direction: s.direction, // "long" | "short"
+        entry: Number(s.entry),
+        exit: Number(s.exit),
+        pnl: Number(s.pnl)
+      }))
+    });
+
+    // 4) Send image as a reply to the same message
+    const FormData = (await import("form-data")).default; // uses the same lib you already use elsewhere
+    const form = new FormData();
+    form.append("chat_id", String(chat_id));
+    form.append("reply_to_message_id", String(msg.message_id));
+    form.append("allow_sending_without_reply", "true");
+    form.append(
+      "caption",
+      `🎯 Your Live PnL — #${meRow?.rank || 0}/${meRow?.total || 0} (${(Number(meRow?.pnl ?? 0)).toFixed(2)}%)`
+    );
+    form.append("photo", buffer, { filename: "live_pnl.png", contentType: "image/png" });
+
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+    await fetch(url, { method: "POST", body: form });
+  }
+} catch (err) {
+  console.error("live->add card error:", err);
+  // stay silent to not spam users if the image fails
+}
+
+    }
+  }
+}
 
 
 
-
-// /leaderboard
+    // Handle /leaderboard
 if (msg?.text?.startsWith("/leaderboard")) {
   const chat_id = msg.chat.id;
   const userId = msg.from?.id?.toString();
 
+  // Most recent finished round
   const { rows: lastRound } = await pool.query(
-    `select * from rounds where results_sent = true order by round_end desc limit 1`
+    `select * from rounds 
+     where results_sent = true 
+     order by round_end desc 
+     limit 1`
   );
+
   if (!lastRound.length) {
     await tgApi("sendMessage", { chat_id, text: "No finished rounds yet." });
   } else {
     const round = lastRound[0];
 
+    // Top 10
     const { rows: top } = await pool.query(
-      `select coalesce(t.username, r.user_id::text) as username, r.user_id, r.pnl
+      `select coalesce(t.username, r.user_id::text) as username,
+              r.user_id, r.pnl
        from round_results r
        left join telegram_users t on t.user_id::text = r.user_id::text
        where r.round_id = $1
        order by r.pnl desc
-       limit 10`, [round.id]
+       limit 10`,
+      [round.id]
     );
 
-    let msgHtml = `🏆 <b>Leaderboard</b>\n<i>Round ended at ${new Date(round.round_end).toLocaleTimeString()}</i>\n\n`;
-    top.forEach((r,i) => {
-      msgHtml += `<code>${String(i+1).padStart(2,' ')}</code> ${esc(r.username)} — <b>${fmtP(r.pnl)}</b>\n`;
-    });
+    if (!top.length) {
+      await tgApi("sendMessage", { chat_id, text: "No results for that round." });
+    } else {
+      let message = `🏆 Leaderboard (Round ended at ${new Date(round.round_end).toLocaleTimeString()})\n\n`;
+      top.forEach((row, i) => {
+        message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
+      });
 
-    // Your position
-    const { rows: ranked } = await pool.query(
-      `select r.user_id, r.pnl,
-              row_number() over(order by r.pnl desc) as rank,
-              count(*) over() as total
-       from round_results r
-       where r.round_id = $1
-       order by r.pnl desc`, [round.id]
-    );
-    const me = ranked.find(r => r.user_id?.toString() === userId);
-    if (me) {
-      msgHtml += `\n👤 <b>You</b>\n• Position: <b>#${me.rank}/${me.total}</b>${topBadge(me.rank, me.total)}\n• PnL: <b>${fmtP(me.pnl)}</b>`;
+      // "You:" line
+      const { rows: ranked } = await pool.query(
+        `select r.user_id, r.pnl,
+                row_number() over(order by r.pnl desc) as rank,
+                count(*) over() as total
+         from round_results r
+         where r.round_id = $1
+         order by r.pnl desc`,
+        [round.id]
+      );
+      const me = ranked.find(r => r.user_id?.toString() === userId);
+      if (me) {
+        const topPct = Math.round((me.rank / me.total) * 100);
+        message += `\n🎯 You: #${me.rank}/${me.total} — ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)`;
 
-      // per-pick final breakdown
-      try {
-        const { rows: meChoices } = await pool.query(
-          `select portfolio from round_results
-           where round_id = $1 and user_id::text = $2::text limit 1`, [round.id, userId]
-        );
-        if (meChoices.length) {
-          const selections = JSON.parse(meChoices[0].portfolio || "[]");
-          const addrs = [...new Set(selections.map(s => s.address).filter(Boolean))];
-          const priceMap = await firstLastPrices(addrs, round.round_start, round.round_end);
-          const decorated = decorateSelectionsWithPnl(selections, priceMap);
+        // Per-pick final breakdown:
+        // - Load my selections from round_results.portfolio
+        // - Compute entry/exit with firstLastPrices(round_start..round_end)
+        // - Use the same math as elsewhere (decorateSelectionsWithPnl)
+        try {
+          const { rows: meChoices } = await pool.query(
+            `select portfolio from round_results
+             where round_id = $1 and user_id::text = $2::text limit 1`,
+            [round.id, userId]
+          );
+          if (meChoices.length) {
+            const selections = JSON.parse(meChoices[0].portfolio || "[]");
+            const addresses = [...new Set(selections.map(s => s.address).filter(Boolean))];
 
-          if (decorated.length) {
-            msgHtml += `\n• Picks:\n`;
-            for (const s of decorated) {
-              const label = esc((s.symbol || s.name || '').toUpperCase());
-              msgHtml += `  ▸ <b>${label}</b> — ${dirTxt(s.direction)} ` +
-                         `<code>${fmtUsd(s.entry ?? 0)} → ${fmtUsd(s.exit ?? 0)}</code> • <b>${fmtP(s.pnl ?? 0)}</b> ${pnlBlock(s.pnl ?? 0)}\n`;
+            // helpers already defined near the top of your file:
+            // firstLastPrices(start,end) + decorateSelectionsWithPnl()
+            const priceMap = await firstLastPrices(addresses, round.round_start, round.round_end); // :contentReference[oaicite:6]{index=6}
+            const decorated = decorateSelectionsWithPnl(selections, priceMap);                      // :contentReference[oaicite:7]{index=7}
+
+            if (decorated.length) {
+              message += `\n\n🧾 Your Picks (final)\nToken | Dir | Entry | Exit | PnL%\n--------------------------------`;
+              for (const s of decorated) {
+                const label = (s.symbol || s.name || "").toUpperCase();
+                const dir = s.direction === 'short' ? 'S' : 'L';
+                const entry = s.entry == null ? "N/A" : `$${Number(s.entry).toFixed(6)}`;
+                const exit  = s.exit  == null ? "N/A" : `$${Number(s.exit ).toFixed(6)}`;
+                const pnl   = s.pnl   == null ? "—"   : `${Number(s.pnl).toFixed(2)}%`;
+                message += `\n${label} | ${dir} | ${entry} | ${exit} | ${pnl}`;
+              }
             }
           }
+        } catch (e) {
+          console.error("leaderboard picks breakdown error", e);
         }
-      } catch(e){ console.error("leaderboard picks breakdown error", e); }
-    }
+      }
 
-    await tgApi("sendMessage", { chat_id, text: msgHtml, parse_mode: "HTML" });
+      await tgApi("sendMessage", { chat_id, text: message });
+    }
   }
 }
-
 
     // Acknowledge update
     res.json({ ok: true });
@@ -1252,7 +1366,11 @@ if (msg?.text?.startsWith("/leaderboard")) {
     console.error("telegram/webhook error:", e);
     res.status(200).json({ ok: true }); // don't retry forever
   }
-}
+});
+
+
+
+
 
 
 
@@ -1591,7 +1709,6 @@ app.get("/health", async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
 });
-
 
 
 
