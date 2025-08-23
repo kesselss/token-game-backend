@@ -275,6 +275,49 @@ async function fetchTokenSnapshot(address) {
   };
 }
 
+async function enrichTokensWithCache(tokens) {
+  try {
+    if (!Array.isArray(tokens) || tokens.length === 0) return tokens || [];
+
+    // Collect addresses we need to enrich
+    const addrs = tokens
+      .map(t => t && t.address)
+      .filter(Boolean);
+
+    if (addrs.length === 0) return tokens;
+
+    // Fetch cached fields
+    const { rows } = await pool.query(
+      `SELECT address,
+              holders,
+              top10holderpercent AS "top10HolderPercent",
+              launchedat         AS "launchedAt"
+         FROM token_cache
+        WHERE address = ANY($1)`,
+      [addrs]
+    );
+
+    // Index cache by address for O(1) merge
+    const cache = Object.fromEntries(rows.map(r => [r.address, r]));
+
+    // Merge best-effort into the outgoing tokens
+    return tokens.map(t => {
+      const c = t && cache[t.address];
+      if (!c) return t;
+      return {
+        ...t,
+        holders: c.holders ?? t.holders ?? null,
+        top10HolderPercent: c.top10HolderPercent ?? t.top10HolderPercent ?? null,
+        launchedAt: c.launchedAt ?? t.launchedAt ?? null,
+      };
+    });
+  } catch (err) {
+    console.error("enrichTokensWithCache error:", err);
+    // Fail open (return original tokens) so the endpoint still works
+    return tokens || [];
+  }
+}
+
 async function fetchHistoryPoints(address) {
   const now = Math.floor(Date.now() / 1000);
   const oneDayAgo = now - 24 * 60 * 60;
@@ -1208,6 +1251,7 @@ app.get("/rounds/current", async (req, res) => {
       round = await createNewRound();
     }
 
+    // Map Birdeye fields -> frontend schema
     const mapToken = (t) => ({
       address: t.address,
       symbol: t.symbol,
@@ -1218,41 +1262,51 @@ app.get("/rounds/current", async (req, res) => {
       liquidity: t.liquidity,
       volume24h: t.volume_24h_usd,
       priceChange24h: t.price_change_24h_percent,
-      holders: t.holder,
-      top10HolderPercent: null,
+      holders: t.holder ?? null,
+      top10HolderPercent: null, // will be filled by enrichment
       launchedAt: t.meme_info?.creation_time
         ? new Date(t.meme_info.creation_time * 1000).toISOString()
         : null,
       updated_at: new Date().toISOString(),
     });
 
-    // Keep the saved 5 (shared) for backward compatibility
+    // Legacy shared 5 (already saved in the round)
     const transformedTokens = (round.tokens || []).map(mapToken);
 
-    // Build per-user order (~20) from today's daily_token_lists
+    // Build per-user order (≈20) from today's daily_token_lists
     const today = new Date().toISOString().slice(0, 10);
     const { rows } = await pool.query(
-      `select tokens from daily_token_lists where round_date = $1 limit 1`,
+      `SELECT tokens FROM daily_token_lists WHERE round_date = $1 LIMIT 1`,
       [today]
     );
 
+    // Fallback if daily list missing
     const dailyPoolRaw = rows.length ? rows[0].tokens : (round.tokens || []);
+
+    // Per-user deterministic shuffle (seeded by round + telegram user id)
     const seed = `${round.id}:${req.tgUser?.id || "anon"}`;
-    const orderedRaw = deterministicShuffle(dailyPoolRaw, seed);
+    const orderedRaw = deterministicShuffle(dailyPoolRaw, seed).slice(0, 20);
     const ordered = orderedRaw.map(mapToken);
+
+    // Enrich BOTH arrays with holders/top10/launch info from token_cache
+    const [tokensEnriched, orderedEnriched] = await Promise.all([
+      enrichTokensWithCache(transformedTokens),
+      enrichTokensWithCache(ordered),
+    ]);
 
     res.json({
       id: round.id,
       start: round.round_start,
       end: round.round_end,
-      tokens: transformedTokens, // shared 5 (old behavior)
-      ordered                   // per-user 20 (new behavior)
+      tokens: tokensEnriched,     // shared 5 (back-compat)
+      ordered: orderedEnriched,   // per-user 20 (frontend will take first 5)
     });
   } catch (e) {
     console.error("Error fetching current round:", e);
     res.status(500).json({ error: "Failed to fetch current round" });
   }
 });
+
 
 
 
