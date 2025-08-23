@@ -135,13 +135,13 @@ export async function generatePnLCard({
 
   ctx.font = `800 56px ${fontFamily}`;
   ctx.fillStyle = chipColor;
-  ctx.fillText(pnlChip, 40, 210);
+  ctx.fillText(pnlChip, 40, 195);
 
   // Optional “Long/Short mix” chip
   const longCount = selections.filter(s => s?.direction === "long").length;
   const shortCount = selections.filter(s => s?.direction === "short").length;
-drawChip(`${longCount} long`, 40, 228, "#1ee3b1");
-drawChip(`${shortCount} short`, 150, 228, "#ff9da1");
+drawChip(`${longCount} long`, 40, 220, "#1ee3b1");
+drawChip(`${shortCount} short`, 150, 220, "#ff9da1");
 
 
   // ---------- Table ----------
@@ -169,7 +169,7 @@ drawChip(`${shortCount} short`, 150, 228, "#ff9da1");
   ctx.fillText("PnL%", colPnlX, headerY);
 
   const rowStartY = headerY + 18;
-  const rowHeight = 54;
+  const rowHeight = 48;
   const maxRows = Math.min(6, selections.length || 0);
   const rows = selections.slice(0, maxRows);
 
