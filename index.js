@@ -279,14 +279,9 @@ async function enrichTokensWithCache(tokens) {
   try {
     if (!Array.isArray(tokens) || tokens.length === 0) return tokens || [];
 
-    // Collect addresses we need to enrich
-    const addrs = tokens
-      .map(t => t && t.address)
-      .filter(Boolean);
-
+    const addrs = tokens.map(t => t && t.address).filter(Boolean);
     if (addrs.length === 0) return tokens;
 
-    // Fetch cached fields
     const { rows } = await pool.query(
       `SELECT address,
               holders,
@@ -297,10 +292,8 @@ async function enrichTokensWithCache(tokens) {
       [addrs]
     );
 
-    // Index cache by address for O(1) merge
     const cache = Object.fromEntries(rows.map(r => [r.address, r]));
 
-    // Merge best-effort into the outgoing tokens
     return tokens.map(t => {
       const c = t && cache[t.address];
       if (!c) return t;
@@ -313,7 +306,6 @@ async function enrichTokensWithCache(tokens) {
     });
   } catch (err) {
     console.error("enrichTokensWithCache error:", err);
-    // Fail open (return original tokens) so the endpoint still works
     return tokens || [];
   }
 }
