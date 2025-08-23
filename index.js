@@ -260,6 +260,34 @@ async function fetchHistoryPoints(address) {
     .filter((p) => typeof p.price === "number" && p.price > 0);
 }
 
+// --- deterministic shuffle (seeded by round + user) ---
+function hash32(str) {
+  let h = 2166136261 >>> 0; // FNV-like
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function seededShuffle(array, seed) {
+  const a = array.slice();
+  const rnd = mulberry32(seed);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+
 // ---------- DB helpers ----------
 async function upsertTokenSnapshot(s) {
 const q = `
@@ -536,11 +564,10 @@ async function updateLivePnL(round) {
 
 async function startNewRound() {
   const now = new Date();
-  // Align to the current hour block
   const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
+  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // Load today's token list
+  // Load today's token pool (aim ~20)
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
@@ -548,20 +575,17 @@ async function startNewRound() {
   );
   if (!rows.length) throw new Error("No daily tokens found for today");
 
-  // Pick 5 random tokens
-  const tokenList = rows[0].tokens;
-  const shuffled = tokenList.sort(() => 0.5 - Math.random());
-  const selected = shuffled.slice(0, 5);
+  const pool = (rows[0].tokens || []).slice(0, 20); // store the *pool*, not 5 picks
 
-  // Save new round
+  // Save new round with the *full pool*
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool)]
   );
 
-  // Broadcast to all Telegram users
+  // Broadcast (link unchanged — adjust if you use PLAY_URL)
   const { rows: users } = await pool.query(`select chat_id from telegram_users`);
   for (const u of users) {
     try {
@@ -1125,11 +1149,9 @@ if (msg?.text?.startsWith("/live")) {
 
 async function createNewRound() {
   const now = new Date();
-  // Align to the current hour block
   const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
+  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // 1) Load today’s token list
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
@@ -1137,22 +1159,18 @@ async function createNewRound() {
   );
   if (!rows.length) throw new Error("No daily tokens available. Did cron run?");
 
-  const tokenList = rows[0].tokens;
+  const pool = (rows[0].tokens || []).slice(0, 20);
 
-  // 2) Shuffle and pick 5 tokens
-  const shuffled = tokenList.sort(() => 0.5 - Math.random());
-  const selected = shuffled.slice(0, 5);
-
-  // 3) Save new round
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end, tokens`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool)]
   );
 
   return inserted[0];
 }
+
 
 
 // ---------- Get current active round ----------
@@ -1171,41 +1189,41 @@ async function getCurrentRound() {
 
 
 
-app.get("/rounds/current", async (_req, res) => {
+app.get("/rounds/current", telegramAuth, async (req, res) => {
   try {
-    let round = await getCurrentRound();
-    if (!round) {
-      round = await createNewRound();
-    }
+    const userId = req.tgUser?.id ? String(req.tgUser.id) : null;
+    if (!userId) return res.status(401).json({ ok: false, error: "Telegram auth required" });
 
-    // Transform the raw Birdeye data to match frontend schema
-    const transformedTokens = (round.tokens || []).map(token => ({
-      address: token.address,
-      symbol: token.symbol,
-      name: token.name,
-      logoURI: token.logo_uri,  // logo_uri -> logoURI
-      price: token.price,
-      marketcap: token.market_cap,  // market_cap -> marketcap
-      liquidity: token.liquidity,
-      volume24h: token.volume_24h_usd,  // volume_24h_usd -> volume24h
-      priceChange24h: token.price_change_24h_percent,  // price_change_24h_percent -> priceChange24h
-      holders: token.holder,  // holder -> holders
-      top10HolderPercent: null, // Not available in meme list API
-      launchedAt: token.meme_info?.creation_time ? new Date(token.meme_info.creation_time * 1000).toISOString() : null,
-      updated_at: new Date().toISOString()
-    }));
+    const { rows: [round] } = await pool.query(
+      `select id, round_start, round_end, tokens
+       from rounds
+       where round_start <= now() and round_end > now()
+       order by round_start desc
+       limit 1`
+    );
+    if (!round) return res.status(404).json({ ok: false, error: "No active round" });
 
-    res.json({
-      id: round.id,
-      start: round.round_start,
-      end: round.round_end,
-      tokens: transformedTokens
+    const pool = Array.isArray(round.tokens) ? round.tokens.slice(0, 20) : [];
+    const seed = hash32(`${round.id}:${userId}`);
+    const ordered = seededShuffle(pool, seed);
+
+    // First 5 are the player's initial set; the rest are possible re-rolls
+    return res.json({
+      ok: true,
+      round: {
+        id: round.id,
+        start: round.round_start,
+        end: round.round_end
+      },
+      tokens: ordered.slice(0, 5), // initial 5 for the UI
+      ordered                       // full user-specific order for re-rolls
     });
   } catch (e) {
-    console.error("Error fetching current round:", e);
-    res.status(500).json({ error: "Failed to fetch current round" });
+    console.error("rounds/current error", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
