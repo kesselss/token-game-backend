@@ -1,5 +1,10 @@
-// pnlCard.js — ES Module (no registerFont; assumes the font already exists)
+// pnlCard.js — ES Module with optional background image
 import { createCanvas, loadImage } from "canvas";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_BG_PATH = path.join(__dirname, "assets", "pnl-bg.png");
 
 /**
  * Generate a PNG buffer for a PnL card.
@@ -11,6 +16,7 @@ import { createCanvas, loadImage } from "canvas";
  * @param {number} options.totalPct                  // total PnL % (e.g., 12.34 or -5.67)
  * @param {Array<Object>} options.selections         // [{ symbol, name, logo, direction, entry, exit, pnl }]
  * @param {string} [options.title="Live PnL"]        // header title
+ * @param {string} [options.backgroundPath]          // optional absolute/relative path to bg image
  * @returns {Promise<Buffer>}                        // PNG buffer
  */
 export async function generatePnLCard({
@@ -19,31 +25,46 @@ export async function generatePnLCard({
   totalPlayers = 0,
   totalPct = 0,
   selections = [],
-  title = "Live PnL"
+  title = "Live PnL",
+  backgroundPath
 } = {}) {
   const width = 1000;
   const height = 600;
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext("2d");
 
-  // ---------- Background ----------
-  const bg = ctx.createLinearGradient(0, 0, width, height);
-  bg.addColorStop(0, "#0e1222");
-  bg.addColorStop(1, "#161b33");
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, width, height);
+  // ---------- Background: image if available, else gradient ----------
+  let drewBg = false;
+  const bgPath = backgroundPath || DEFAULT_BG_PATH;
+  try {
+    const bgImg = await loadImage(bgPath);
+    // scale to full canvas (800x600 will scale to 1000x600 fine)
+    ctx.drawImage(bgImg, 0, 0, width, height);
+    drewBg = true;
+  } catch {
+    // ignore if file not found; we’ll draw our gradient fallback
+  }
+  if (!drewBg) {
+    const bg = ctx.createLinearGradient(0, 0, width, height);
+    bg.addColorStop(0, "#0e1222");
+    bg.addColorStop(1, "#161b33");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, width, height);
 
-  // Subtle vignette
-  ctx.globalAlpha = 0.35;
-  const vignette = ctx.createRadialGradient(width / 2, height / 2, 80, width / 2, height / 2, Math.max(width, height));
-  vignette.addColorStop(0, "rgba(0,0,0,0)");
-  vignette.addColorStop(1, "rgba(0,0,0,0.8)");
-  ctx.fillStyle = vignette;
-  ctx.fillRect(0, 0, width, height);
-  ctx.globalAlpha = 1;
+    // Subtle vignette
+    ctx.globalAlpha = 0.35;
+    const vignette = ctx.createRadialGradient(
+      width / 2, height / 2, 80, width / 2, height / 2, Math.max(width, height)
+    );
+    vignette.addColorStop(0, "rgba(0,0,0,0)");
+    vignette.addColorStop(1, "rgba(0,0,0,0.8)");
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, width, height);
+    ctx.globalAlpha = 1;
+  }
 
   // ---------- Helpers ----------
-  const fontFamily = "Changa, sans-serif"; // the font is assumed to exist
+  const fontFamily = "Changa, sans-serif"; // assumed available system font
   const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
   const fmtPct = (n) => (n >= 0 ? `+${n.toFixed(2)}%` : `${n.toFixed(2)}%`);
   const fmtPrice = (v) => {
@@ -52,9 +73,7 @@ export async function generatePnLCard({
     if (abs === 0) return "0";
     if (abs >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
     if (abs >= 1) return v.toFixed(4).replace(/\.?0+$/, "");
-    // tiny tokens
     const str = v.toPrecision(7);
-    // trim trailing zeros in mantissa
     return str.replace(/(\.\d*?[1-9])0+e/, "$1e").replace(/\.0+$/, "");
   };
   const drawRoundedRect = (x, y, w, h, r) => {
@@ -91,25 +110,6 @@ export async function generatePnLCard({
       return null;
     }
   }
-  const drawTokenLogo = async (logo, x, y, size, fallback) => {
-    const img = await tryLoad(logo);
-    ctx.save();
-    drawRoundedRect(x, y, size, size, size * 0.22);
-    ctx.clip();
-    if (img) {
-      ctx.drawImage(img, x, y, size, size);
-    } else {
-      // fallback
-      ctx.fillStyle = "#252b4a";
-      ctx.fillRect(x, y, size, size);
-      ctx.fillStyle = "#8791c7";
-      ctx.font = `700 ${Math.floor(size * 0.45)}px ${fontFamily}`;
-      const letter = (fallback || "?").toString().slice(0, 1).toUpperCase();
-      const tw = ctx.measureText(letter).width;
-      ctx.fillText(letter, x + (size - tw) / 2, y + size * 0.72);
-    }
-    ctx.restore();
-  };
 
   // ---------- Header ----------
   ctx.fillStyle = "#ffd54a";
@@ -143,7 +143,6 @@ export async function generatePnLCard({
   drawChip(`📉 ${shortCount} short`, 150, 228, "#ff9da1");
 
   // ---------- Table ----------
-  // Card container
   const cardX = 32;
   const cardY = 270;
   const cardW = width - cardX * 2;
@@ -153,7 +152,6 @@ export async function generatePnLCard({
   ctx.fillStyle = "rgba(255,255,255,0.06)";
   ctx.fill();
 
-  // Header row
   const colLogoX = cardX + 18;
   const colSymbolX = colLogoX + 52;
   const colDirX = colSymbolX + 220;
@@ -168,13 +166,11 @@ export async function generatePnLCard({
   ctx.fillText("Entry → Exit", colEntryExitX, headerY);
   ctx.fillText("PnL%", colPnlX, headerY);
 
-  // Rows
   const rowStartY = headerY + 18;
   const rowHeight = 54;
   const maxRows = Math.min(6, selections.length || 0);
   const rows = selections.slice(0, maxRows);
 
-  // Preload all logos in parallel
   const logos = await Promise.all(rows.map(r => tryLoad(r.logo)));
 
   for (let i = 0; i < rows.length; i++) {
@@ -189,7 +185,7 @@ export async function generatePnLCard({
     ctx.lineTo(cardX + cardW - 12, y - rowHeight + 16);
     ctx.stroke();
 
-    // Logo
+    // Logo cell
     ctx.save();
     drawRoundedRect(colLogoX, y - 40, 40, 40, 10);
     ctx.clip();
