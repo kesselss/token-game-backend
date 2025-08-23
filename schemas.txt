@@ -1,0 +1,111 @@
+create table public.daily_token_lists (
+  id uuid not null default gen_random_uuid (),
+  round_date date not null,
+  tokens jsonb not null,
+  created_at timestamp without time zone null default now(),
+  constraint daily_token_lists_pkey primary key (id),
+  constraint daily_token_lists_round_date_key unique (round_date)
+) TABLESPACE pg_default;
+
+
+create table public.plays (
+  id text not null,
+  round_id uuid not null,
+  user_id text not null,
+  chat_id bigint not null,
+  username text null,
+  timestamp timestamp without time zone null default now(),
+  selections jsonb not null,
+  constraint plays_pkey primary key (id),
+  constraint plays_round_id_fkey foreign KEY (round_id) references rounds (id)
+) TABLESPACE pg_default;
+
+create table public.prices (
+  token_address text not null,
+  ts timestamp without time zone not null,
+  price numeric not null,
+  constraint prices_pkey primary key (token_address, ts),
+  constraint prices_token_address_fkey foreign KEY (token_address) references tokens (address) on delete CASCADE
+) TABLESPACE pg_default;
+
+create table public.round_results (
+  id uuid not null default gen_random_uuid (),
+  round_id uuid not null,
+  user_id text not null,
+  chat_id bigint not null,
+  portfolio jsonb not null,
+  pnl numeric null,
+  created_at timestamp without time zone null default now(),
+  choices jsonb null,
+  constraint round_results_pkey primary key (id),
+  constraint round_results_unique unique (round_id, user_id),
+  constraint round_results_round_id_fkey foreign KEY (round_id) references rounds (id) on delete CASCADE
+) TABLESPACE pg_default;
+
+create table public.round_tokens (
+  round_id integer not null,
+  token_address text not null,
+  constraint round_tokens_pkey primary key (round_id, token_address),
+  constraint round_tokens_token_address_fkey foreign KEY (token_address) references tokens (address) on delete CASCADE
+) TABLESPACE pg_default;
+
+create table public.rounds (
+  id uuid not null default gen_random_uuid (),
+  round_start timestamp without time zone not null,
+  round_end timestamp without time zone not null,
+  tokens jsonb not null,
+  created_at timestamp without time zone null default now(),
+  results_sent boolean null default false,
+  constraint rounds_pkey primary key (id)
+) TABLESPACE pg_default;
+
+create table public.telegram_users (
+  chat_id bigint not null,
+  first_seen timestamp without time zone null default now(),
+  last_seen timestamp without time zone null default now(),
+  user_id text null,
+  username text null,
+  constraint telegram_users_pkey primary key (chat_id),
+  constraint telegram_users_user_id_unique unique (user_id)
+) TABLESPACE pg_default;
+
+create table public.token_cache (
+  address text not null,
+  symbol text null,
+  name text null,
+  logo text null,
+  price numeric null,
+  marketcap numeric null,
+  liquidity numeric null,
+  volume24h numeric null,
+  pricechange24h numeric null,
+  holders numeric null,
+  top10holderpercent numeric null,
+  launchedat timestamp without time zone null,
+  updated_at timestamp without time zone null default now(),
+  constraint token_cache_pkey primary key (address)
+) TABLESPACE pg_default;
+
+create table public.token_history (
+  address text not null,
+  ts timestamp without time zone not null,
+  price numeric not null,
+  constraint token_history_pkey primary key (address, ts)
+) TABLESPACE pg_default;
+
+create table public.tokens (
+  address text not null,
+  symbol text null,
+  name text null,
+  logouri text null,
+  price numeric null,
+  marketcap numeric null,
+  liquidity numeric null,
+  volume24h numeric null,
+  pricechange24h numeric null,
+  holders bigint null,
+  top10holderpercent numeric null,
+  launchedat timestamp without time zone null,
+  updated_at timestamp without time zone null default now(),
+  constraint tokens_pkey primary key (address)
+) TABLESPACE pg_default;
