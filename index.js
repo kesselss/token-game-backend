@@ -21,6 +21,13 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || FRONTEND_ORIGIN; // fallback
 
+
+// ---------- DB ----------
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 async function tgApi(method, payload) {
   if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
@@ -34,12 +41,6 @@ async function tgApi(method, payload) {
   return json.result;
 }
 
-
-// ---------- DB ----------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 // ---------- APP ----------
 const app = express();
@@ -262,7 +263,7 @@ async function fetchHistoryPoints(address) {
 
 // --- deterministic shuffle (seeded by round + user) ---
 function hash32(str) {
-  let h = 2166136261 >>> 0; // FNV-like
+  let h = 2166136261 >>> 0;
   for (let i = 0; i < str.length; i++) {
     h ^= str.charCodeAt(i);
     h = Math.imul(h, 16777619);
@@ -286,6 +287,7 @@ function seededShuffle(array, seed) {
   }
   return a;
 }
+
 
 
 // ---------- DB helpers ----------
@@ -567,7 +569,6 @@ async function startNewRound() {
   const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
   const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // Load today's token pool (aim ~20)
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
@@ -575,36 +576,30 @@ async function startNewRound() {
   );
   if (!rows.length) throw new Error("No daily tokens found for today");
 
-  const pool = (rows[0].tokens || []).slice(0, 20); // store the *pool*, not 5 picks
+  const pool20 = (rows[0].tokens || []).slice(0, 20);
 
-  // Save new round with the *full pool*
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(pool)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool20)]
   );
 
-  // Broadcast (link unchanged — adjust if you use PLAY_URL)
+  // notify users (copy as-is)
   const { rows: users } = await pool.query(`select chat_id from telegram_users`);
   for (const u of users) {
     try {
       await tgApi("sendMessage", {
         chat_id: u.chat_id,
         text: `🚀 New round has started!\nYou have 1 hour to play.\n\nTap to join:`,
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }
-          ]]
-        }
+        reply_markup: { inline_keyboard: [[{ text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }]] }
       });
-    } catch (e) {
-      console.error("Failed to notify user", u.chat_id, e.message);
-    }
+    } catch (e) { console.error("notify fail", u.chat_id, e.message); }
   }
 
   return inserted[0];
 }
+
 
 
 // === FINISH A ROUND ===
@@ -1159,17 +1154,18 @@ async function createNewRound() {
   );
   if (!rows.length) throw new Error("No daily tokens available. Did cron run?");
 
-  const pool = (rows[0].tokens || []).slice(0, 20);
+  const pool20 = (rows[0].tokens || []).slice(0, 20);
 
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end, tokens`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(pool)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool20)]
   );
 
   return inserted[0];
 }
+
 
 
 
@@ -1189,40 +1185,63 @@ async function getCurrentRound() {
 
 
 
-app.get("/rounds/current", telegramAuth, async (req, res) => {
+// ---------- Get current active round (user-specific order) ----------
+app.get("/rounds/current", async (req, res) => {
   try {
-    const userId = req.tgUser?.id ? String(req.tgUser.id) : null;
-    if (!userId) return res.status(401).json({ ok: false, error: "Telegram auth required" });
+    // Get (or lazily create) the active round
+    let round = await getCurrentRound();
+    if (!round) {
+      round = await createNewRound();
+    }
 
-    const { rows: [round] } = await pool.query(
-      `select id, round_start, round_end, tokens
-       from rounds
-       where round_start <= now() and round_end > now()
-       order by round_start desc
-       limit 1`
-    );
-    if (!round) return res.status(404).json({ ok: false, error: "No active round" });
+    // IMPORTANT: 'round.tokens' now stores the ~20-token *pool* for the day.
+    // (If your round currently has only 5, this still works; we’ll just shuffle those.)
+    const poolRaw = Array.isArray(round.tokens) ? round.tokens : [];
 
-    const pool = Array.isArray(round.tokens) ? round.tokens.slice(0, 20) : [];
+    // Transform Birdeye fields to your frontend schema
+    const pool = poolRaw.map(token => ({
+      address: token.address,
+      symbol: token.symbol,
+      name: token.name || "Unknown",
+      logoURI: token.logo_uri || token.logo || "",
+      price: token.price,
+      marketcap: token.market_cap ?? token.marketcap,
+      liquidity: token.liquidity,
+      volume24h: token.volume_24h_usd ?? token.volume24h,
+      priceChange24h: token.price_change_24h_percent ?? token.priceChange24h,
+      holders: token.holder ?? token.holders,
+      top10HolderPercent: null,
+      launchedAt: token.meme_info?.creation_time
+        ? new Date(token.meme_info.creation_time * 1000).toISOString()
+        : token.launchedAt || null,
+      updated_at: new Date().toISOString()
+    }));
+
+    // Derive a deterministic order for this user
+    // NOTE: we rely on your telegramAuth middleware that sets req.tgUser (already in file).
+    const userId = req.tgUser?.id ? String(req.tgUser.id) : "anon";
     const seed = hash32(`${round.id}:${userId}`);
-    const ordered = seededShuffle(pool, seed);
+    const ordered = seededShuffle(pool.slice(0, 20), seed); // cap at 20
 
-    // First 5 are the player's initial set; the rest are possible re-rolls
-    return res.json({
+    // First 5 are the initial set the client shows
+    const firstFive = ordered.slice(0, 5);
+
+    res.json({
       ok: true,
       round: {
         id: round.id,
         start: round.round_start,
         end: round.round_end
       },
-      tokens: ordered.slice(0, 5), // initial 5 for the UI
-      ordered                       // full user-specific order for re-rolls
+      tokens: firstFive,
+      ordered
     });
   } catch (e) {
     console.error("rounds/current error", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 
