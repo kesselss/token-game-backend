@@ -1201,57 +1201,74 @@ async function getCurrentRound() {
 
 
 
-app.get("/rounds/current", async (req, res) => {
+// ---------- Get current active round (enriched with cache: holders/top10/launch) ----------
+app.get("/rounds/current", async (_req, res) => {
   try {
     let round = await getCurrentRound();
-    if (!round) round = await createNewRound(); // defines start/end only
+    if (!round) {
+      round = await createNewRound();
+    }
 
-    // pull today's full 20-token pool from daily_token_lists
-    const today = new Date().toISOString().slice(0, 10);
-    const { rows: dl } = await pool.query(
-      `select tokens from daily_token_lists where round_date = $1 limit 1`,
-      [today]
-    );
-    const pool = (dl[0]?.tokens || []);
-
-    // map Birdeye fields -> frontend fields (same mapping you already use)
-    const transform = (token) => ({
+    // 1) Transform raw Birdeye token objects saved on the round -> frontend schema
+    const transformedTokens = (round.tokens || []).map(token => ({
       address: token.address,
       symbol: token.symbol,
       name: token.name,
-      logoURI: token.logo_uri,
+      logoURI: token.logo_uri,                 // logo_uri -> logoURI
       price: token.price,
-      marketcap: token.market_cap,
+      marketcap: token.market_cap,             // market_cap -> marketcap
       liquidity: token.liquidity,
-      volume24h: token.volume_24h_usd,
-      priceChange24h: token.price_change_24h_percent,
-      holders: token.holder,
-      top10HolderPercent: null,
+      volume24h: token.volume_24h_usd,         // volume_24h_usd -> volume24h
+      priceChange24h: token.price_change_24h_percent, // -> priceChange24h
+      holders: token.holder ?? null,           // may be missing on the meme list → fill from cache next
+      top10HolderPercent: null,                // not available on the meme list → fill from cache next
       launchedAt: token.meme_info?.creation_time
         ? new Date(token.meme_info.creation_time * 1000).toISOString()
         : null,
       updated_at: new Date().toISOString()
-    });
+    }));
 
-    const transformedPool = pool.map(transform);
+    // 2) Enrich from token_cache (this fixes "Holders: N/A" on the card)
+    const addresses = transformedTokens.map(t => t.address);
+    if (addresses.length) {
+      const { rows: cacheRows } = await pool.query(
+        `select
+           address,
+           holders,
+           top10holderpercent as "top10HolderPercent",
+           launchedat as "launchedAt"
+         from token_cache
+         where address = any($1::text[])`,
+        [addresses]
+      );
+      const byAddr = new Map(cacheRows.map(r => [r.address, r]));
+      for (let i = 0; i < transformedTokens.length; i++) {
+        const t = transformedTokens[i];
+        const c = byAddr.get(t.address);
+        if (c) {
+          transformedTokens[i] = {
+            ...t,
+            holders: (c.holders ?? t.holders ?? null),
+            top10HolderPercent: (c.top10HolderPercent ?? t.top10HolderPercent ?? null),
+            launchedAt: (c.launchedAt ?? t.launchedAt ?? null)
+          };
+        }
+      }
+    }
 
-    // make a per-user deterministic order
-    const userId = req.tgUser?.id ? String(req.tgUser.id) : "anon";
-    const ordered = seededShuffle(transformedPool, `${round.id}:${userId}`);
-
-    // keep 'tokens' for backward-compat, but NOW derive it from the ordered list
+    // 3) Respond
     res.json({
       id: round.id,
       start: round.round_start,
       end: round.round_end,
-      tokens: ordered.slice(0, 5),
-      ordered
+      tokens: transformedTokens
     });
   } catch (e) {
     console.error("Error fetching current round:", e);
     res.status(500).json({ error: "Failed to fetch current round" });
   }
 });
+
 
 
 
