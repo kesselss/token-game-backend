@@ -1161,9 +1161,9 @@ if (msg?.text?.startsWith("/live")) {
       );
 
       const endTime = new Date(round.round_end).toLocaleTimeString();
-      let message = `📊 Live Standings\nEnds ${endTime}\n\n`;
+      let message = `<b>📊 Live Standings</b>\nEnds ${endTime}\n\n`;
       top.forEach((row, i) => {
-        message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
+        message += `${i + 1}. <b>${row.username}</b> — <b>${parseFloat(row.pnl).toFixed(2)}%</b>\n`;
       });
 
       // Add "You" section + per-pick breakdown
@@ -1172,9 +1172,9 @@ if (msg?.text?.startsWith("/live")) {
         const topPct = Math.round((me.rank / me.total) * 100);
 
         // header
-        message += `\nYou\n`;
-        message += `• Position: #${me.rank}/${me.total}\n`;
-        message += `• PnL: ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
+        message += `\n🎯 <b>You</b>\n`;
+        message += `• <b>Position:</b> #${me.rank}/${me.total}\n`;
+        message += `• <b>PnL:</b> ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
 
         try {
           const { rows: picks } = await pool.query(
@@ -1186,10 +1186,10 @@ if (msg?.text?.startsWith("/live")) {
           );
 
           if (picks.length) {
-            message += `• Picks:\n`;
+            message += `• <b>Picks:</b>\n`;
             for (const p of picks) {
               const label = (p.symbol || p.name || "").toUpperCase();
-              const word = p.direction === "short" ? "Short " : "Long  ";
+              const word = p.direction === "short" ? "Short" : "Long";
               const entry = `$${Number(p.entry_price ?? 0).toFixed(6)}`;
               const now   = `$${Number(p.current_price ?? 0).toFixed(6)}`;
               const pnl   = Number(p.pnl ?? 0);
@@ -1197,7 +1197,7 @@ if (msg?.text?.startsWith("/live")) {
               const barsN = Math.max(1, Math.min(5, Math.round(Math.abs(pnl) / 5)));
               const bars  = (pnl >= 0 ? "🟩" : "🟥").repeat(barsN);
 
-              message += `• ${label} — ${word} ${entry} → ${now}  ${sign}${pnl.toFixed(2)}% ${bars}\n`;
+              message += `• <b>${label}</b> — ${word} ${entry} → ${now}  <b>${sign}${pnl.toFixed(2)}%</b> ${bars}\n`;
             }
           }
         } catch (e) {
@@ -1205,17 +1205,16 @@ if (msg?.text?.startsWith("/live")) {
         }
       }
 
-      await tgApi("sendMessage", { chat_id, text: message });
+      await tgApi("sendMessage", { 
+        chat_id, 
+        text: message,
+        parse_mode: "HTML"  // ✅ important
+      });
 
-      // --- ADD: PnL image reply (keep existing text above) ---
+      // --- Image reply remains untouched ---
       try {
-        const chat_id = msg.chat.id;
-        const userId = msg.from?.id?.toString();
-
         const roundNow = typeof round !== "undefined" && round ? round : await getCurrentRound();
-        if (!roundNow) {
-          // no active round
-        } else {
+        if (roundNow) {
           const { rows: meRows } = await pool.query(
             `select user_id, pnl,
                     row_number() over(order by pnl desc) as rank,
@@ -1272,6 +1271,7 @@ if (msg?.text?.startsWith("/live")) {
     }
   }
 }
+
 
 
 
