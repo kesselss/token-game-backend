@@ -5,6 +5,10 @@ import fetch from "node-fetch";
 import pkg from "pg";
 import crypto from "crypto";
 
+// replace the require line
+import { generatePnLCard } from "./pnlCard.js";
+
+
 const { Pool } = pkg; //s
 
 // ---------- ENV ----------
@@ -15,7 +19,6 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 const PLAY_URL = "https://degendle.com/daily-game/";
 
-const { generatePnLCard } = require("./pnlCard"); // top of file
 
 
 
