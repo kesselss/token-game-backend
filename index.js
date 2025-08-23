@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
+const PLAY_URL = "https://degendle.com/daily-game/";
 
 
 // ---------- Telegram constants & helper ----------
@@ -20,7 +21,16 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || FRONTEND_ORIGIN; // fallback
 
+<<<<<<< HEAD
 const { generatePnLCard } = require("./pnlCard"); // top of file
+=======
+
+// ---------- DB ----------OKay 
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
 
 async function tgApi(method, payload) {
   if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
@@ -35,12 +45,6 @@ async function tgApi(method, payload) {
   return json.result;
 }
 
-
-// ---------- DB ----------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 // ---------- APP ----------
 const app = express();
@@ -133,6 +137,7 @@ app.use(telegramAuth);
 
 const ALLOWED_ORIGINS = [
   "https://degendle.com",
+  "https://degendle.com/daily-game",
   "https://charming-dieffenbachia-a9e8f1.netlify.app"
 ];
 
@@ -207,12 +212,49 @@ async function fetchTopMemeTokens(limit = 20, minVolume = 10000, minMarketCap = 
   return json?.data?.items || [];
 }
 
+function seededShuffle(arr, seedStr) {
+  // Tiny mulberry32 PRNG
+  let seed = 0;
+  for (let i = 0; i < seedStr.length; i++) seed = (seed * 31 + seedStr.charCodeAt(i)) >>> 0;
+  function rnd() { // 0..1
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t ^= t + Math.imul(t ^ t >>> 7, 61 | t);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function esc(s){ return String(s ?? "").replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+const fmtUsd = v => '$' + Number(v ?? 0).toFixed(6);
+const fmtP = v => (v>=0?'+':'') + Number(v ?? 0).toFixed(2) + '%';
+const dirTxt = d => d === 'short' ? '📉 Short' : '📈 Long';
+const pnlBlock = v => v > 0 ? '🟩' : v < 0 ? '🟥' : '⬜';
+function topBadge(rank,total){
+  if(!total || total < 10) return '';                  // hide for tiny samples
+  const pct = Math.max(1, Math.ceil((rank/total)*100));// classic “Top 1% is best”
+  return ` (Top ${pct}%)`;
+}
 
 
 async function beJson(url) {
   const res = await fetch(url, { headers: BE_HEADERS });
   if (!res.ok) throw new Error(`Birdeye ${res.status} for ${url}`);
   return res.json();
+}
+
+// Deterministic shuffle by hashing token.address with a seed
+function deterministicShuffle(arr, seed) {
+  return arr.slice().sort((a, b) => {
+    const ha = crypto.createHmac("sha256", seed).update(a.address).digest("hex");
+    const hb = crypto.createHmac("sha256", seed).update(b.address).digest("hex");
+    return ha.localeCompare(hb);
+  });
 }
 
 async function fetchTokenSnapshot(address) {
@@ -249,6 +291,79 @@ async function fetchTokenSnapshot(address) {
   };
 }
 
+// Get first and last prices for a set of token addresses in a time window
+async function firstLastPrices(addresses, startIso, endIso) {
+  if (!addresses.length) return {};
+  const { rows } = await pool.query(
+    `
+    with firsts as (
+      select distinct on (address) address, price as entry
+      from token_history
+      where address = any($1) and ts between $2 and $3
+      order by address, ts asc
+    ),
+    lasts as (
+      select distinct on (address) address, price as exit
+      from token_history
+      where address = any($1) and ts between $2 and $3
+      order by address, ts desc
+    )
+    select f.address, f.entry, l.exit
+    from firsts f join lasts l using(address)
+    `,
+    [addresses, startIso, endIso]
+  );
+  const map = {};
+  rows.forEach(r => map[r.address] = { entry: Number(r.entry), exit: Number(r.exit) });
+  return map;
+}
+
+function decorateSelectionsWithPnl(selections, priceMap) {
+  return selections.map(s => {
+    const p = priceMap[s.address];
+    if (!p || !p.entry || !p.exit) return { ...s, entry: null, exit: null, pnl: null };
+    const move = ((p.exit - p.entry) / p.entry) * 100;
+    const pnl = s.direction === 'short' ? -move : move;
+    return { ...s, entry: p.entry, exit: p.exit, pnl };
+  });
+}
+
+
+async function enrichTokensWithCache(tokens) {
+  try {
+    if (!Array.isArray(tokens) || tokens.length === 0) return tokens || [];
+
+    const addrs = tokens.map(t => t && t.address).filter(Boolean);
+    if (addrs.length === 0) return tokens;
+
+    const { rows } = await pool.query(
+      `SELECT address,
+              holders,
+              top10holderpercent AS "top10HolderPercent",
+              launchedat         AS "launchedAt"
+         FROM token_cache
+        WHERE address = ANY($1)`,
+      [addrs]
+    );
+
+    const cache = Object.fromEntries(rows.map(r => [r.address, r]));
+
+    return tokens.map(t => {
+      const c = t && cache[t.address];
+      if (!c) return t;
+      return {
+        ...t,
+        holders: c.holders ?? t.holders ?? null,
+        top10HolderPercent: c.top10HolderPercent ?? t.top10HolderPercent ?? null,
+        launchedAt: c.launchedAt ?? t.launchedAt ?? null,
+      };
+    });
+  } catch (err) {
+    console.error("enrichTokensWithCache error:", err);
+    return tokens || [];
+  }
+}
+
 async function fetchHistoryPoints(address) {
   const now = Math.floor(Date.now() / 1000);
   const oneDayAgo = now - 24 * 60 * 60;
@@ -259,6 +374,26 @@ async function fetchHistoryPoints(address) {
     .map((p) => ({ ts: new Date(p.unixTime * 1000).toISOString(), price: p.value }))
     .filter((p) => typeof p.price === "number" && p.price > 0);
 }
+
+// --- deterministic shuffle (seeded by round + user) ---
+function hash32(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+
 
 // ---------- DB helpers ----------
 async function upsertTokenSnapshot(s) {
@@ -299,6 +434,59 @@ const vals = [
 await pool.query(q, vals);
 
 }
+
+// --- Price helpers ---
+async function getEntryAndCurrentPrices(address, round, { final=false } = {}) {
+  // entry = first price at/after round_start; fallback = last before start
+  const { rows: entry1 } = await pool.query(
+    `select price from token_history
+     where address = $1 and ts >= $2
+     order by ts asc limit 1`,
+    [address, round.round_start]
+  );
+  let entry = entry1[0]?.price;
+  if (entry == null) {
+    const { rows: entry2 } = await pool.query(
+      `select price from token_history
+       where address = $1 and ts < $2
+       order by ts desc limit 1`,
+      [address, round.round_start]
+    );
+    entry = entry2[0]?.price;
+  }
+
+  // current = last price up to now (live) or round_end (final), but not before start
+  const boundTs = final ? round.round_end : new Date().toISOString();
+  const { rows: cur1 } = await pool.query(
+    `select price from token_history
+     where address = $1 and ts >= $2 and ts <= $3
+     order by ts desc limit 1`,
+    [address, round.round_start, boundTs]
+  );
+  let current = cur1[0]?.price;
+
+  if (current == null) {
+    // fallback to token_cache.price if available
+    const { rows: cur2 } = await pool.query(
+      `select price from token_cache where address = $1 limit 1`,
+      [address]
+    );
+    current = cur2[0]?.price;
+  }
+
+  return {
+    entry: entry != null ? Number(entry) : null,
+    current: current != null ? Number(current) : null
+  };
+}
+
+function pickPnlPct(entry, current, direction) {
+  if (!entry || !current) return null;
+  const move = (current - entry) / entry * 100;
+  return direction === "short" ? -move : move;
+}
+
+
 
 async function insertHistoryRows(address, rows) {
   if (!rows.length) return;
@@ -418,40 +606,74 @@ async function calculatePnL(selections, round) {
   return n ? total / n : 0;
 }
 
-// ---------- Update live PnL for an active round ----------
+// ---------- Update live PnL for an active round (with per-pick detail) ----------
 async function updateLivePnL(round) {
   // fetch all plays in this round
   const { rows: plays } = await pool.query(
-    `SELECT id, user_id, chat_id, selections
+    `SELECT user_id, selections
      FROM plays
      WHERE round_id = $1`,
     [round.id]
   );
 
   for (const play of plays) {
-    // calculate using your real calculatePnL
-    const pnl = await calculatePnL(play.selections, round);
+    const selections = Array.isArray(play.selections) ? play.selections : [];
+    let sum = 0, n = 0;
 
+    for (const pick of selections) {
+      const { address, symbol, name, logoURI, direction } = pick || {};
+      if (!address || !direction) continue;
+
+      const { entry, current } = await getEntryAndCurrentPrices(address, round, { final:false });
+      const pnl = pickPnlPct(entry, current, direction);
+
+      if (pnl != null) { sum += pnl; n += 1; }
+
+      // Upsert per-pick live detail
+      await pool.query(
+        `insert into live_pnl_detail
+          (round_id, user_id, address, symbol, name, logo, direction, entry_price, current_price, pnl)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         on conflict (round_id, user_id, address)
+         do update set
+           symbol        = excluded.symbol,
+           name          = excluded.name,
+           logo          = excluded.logo,
+           direction     = excluded.direction,
+           entry_price   = excluded.entry_price,
+           current_price = excluded.current_price,
+           pnl           = excluded.pnl,
+           last_updated  = now()`,
+        [
+          round.id, play.user_id, address,
+          symbol || null, name || null, logoURI || null,
+          direction, entry ?? 0, current ?? 0, pnl ?? 0
+        ]
+      );
+    }
+
+    const total = n ? (sum / n) : 0;
+
+    // Upsert total (keeps your existing table)
     await pool.query(
-      `INSERT INTO live_pnl (round_id, user_id, pnl)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (round_id, user_id)
-       DO UPDATE SET pnl = EXCLUDED.pnl, last_updated = now()`,
-      [round.id, play.user_id, pnl]
+      `insert into live_pnl (round_id, user_id, pnl)
+       values ($1, $2, $3)
+       on conflict (round_id, user_id)
+       do update set pnl = excluded.pnl, last_updated = now()`,
+      [round.id, play.user_id, total]
     );
   }
 
-  console.log(`📊 Updated live PnL for round ${round.id}`);
+  console.log(`📊 Updated live per-pick + totals for round ${round.id}`);
 }
 
 
 
 async function startNewRound() {
   const now = new Date();
-  const start = new Date(Math.floor(now.getTime() / (10 * 60 * 1000)) * (10 * 60 * 1000));
-  const end = new Date(start.getTime() + 10 * 60 * 1000);
+  const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
+  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // Load today's token list
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
@@ -459,41 +681,36 @@ async function startNewRound() {
   );
   if (!rows.length) throw new Error("No daily tokens found for today");
 
-  // Pick 5 random tokens
-  const tokenList = rows[0].tokens;
-  const shuffled = tokenList.sort(() => 0.5 - Math.random());
-  const selected = shuffled.slice(0, 5);
+  const pool20 = (rows[0].tokens || []).slice(0, 20);
 
-  // Save new round
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool20)]
   );
 
-  // Broadcast to all Telegram users
+  // notify users (copy as-is)
   const { rows: users } = await pool.query(`select chat_id from telegram_users`);
   for (const u of users) {
     try {
       await tgApi("sendMessage", {
         chat_id: u.chat_id,
-        text: `🚀 New round has started!\nYou have 10 minutes to play.\n\nTap to join:`,
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }
-          ]]
-        }
+        text: `🚀 New round has started!\nYou have 1 hour to play.\n\nTap to join:`,
+        reply_markup: { inline_keyboard: [[{ text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }]] }
       });
-    } catch (e) {
-      console.error("Failed to notify user", u.chat_id, e.message);
-    }
+    } catch (e) { console.error("notify fail", u.chat_id, e.message); }
   }
 
   return inserted[0];
 }
 
 
+<<<<<<< HEAD
+=======
+
+// === FINISH A ROUND ===
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
 async function finishRound(round) {
   try {
     console.log(`⚡ Finishing round ${round.id}`);
@@ -513,6 +730,7 @@ async function finishRound(round) {
       return;
     }
 
+<<<<<<< HEAD
     // --- helpers ---
     async function getPriceAtOrNear(address, tsIso, preferBefore = true) {
       const q = preferBefore
@@ -530,6 +748,11 @@ async function finishRound(round) {
       const move = (exit - entry) / entry * 100;
       return direction === "short" ? -move : move;
     }
+=======
+    // --- price helpers + pickPnlPct (unchanged) ---
+    async function getPriceAtOrNear(address, tsIso, preferBefore = true) { /* ... same as you pasted ... */ }
+    function pickPnlPct(entry, exit, direction) { /* ... same as you pasted ... */ }
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
 
     // 2) For each play: compute per-pick PnL and total; save to round_results
     for (const play of plays) {
@@ -542,7 +765,11 @@ async function finishRound(round) {
         if (!address || !direction) continue;
 
         const entry = await getPriceAtOrNear(address, round.round_start, true);
+<<<<<<< HEAD
         const exit  = await getPriceAtOrNear(address, round.round_end,   false);
+=======
+        const exit  = await getPriceAtOrNear(address, round.round_end,   true);
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
         const pnl   = pickPnlPct(entry, exit, direction);
 
         if (pnl != null) { sum += pnl; n += 1; }
@@ -552,8 +779,13 @@ async function finishRound(round) {
           name: name || null,
           logo: logoURI || null,
           direction,
+<<<<<<< HEAD
           entry: entry ?? null,
           exit: exit ?? null,
+=======
+          entry_price: entry ?? 0,
+          current_price: exit ?? 0,
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
           pnl: pnl ?? 0
         });
       }
@@ -598,13 +830,22 @@ async function finishRound(round) {
       message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
+<<<<<<< HEAD
     // 4) DM each participant: leaderboard + their personal PnL card
+=======
+    // 4) DM each participant: leaderboard + their personal rank + breakdown
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
     for (const play of plays) {
       if (!play.chat_id) continue;
       const fin = play.__final || { total: 0, rows: [] };
 
+<<<<<<< HEAD
       // rank lookup
       let rank = 0, totalPlayers = 0;
+=======
+      // fetch this player’s rank + total
+      let rankLine = "";
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
       try {
         const { rows: [meRow] } = await pool.query(
           `select r.pnl,
@@ -614,11 +855,19 @@ async function finishRound(round) {
            where r.round_id = $1 and r.user_id::text = $2::text`,
           [round.id, play.user_id]
         );
+<<<<<<< HEAD
         if (meRow) { rank = meRow.rank; totalPlayers = meRow.total; }
+=======
+        if (meRow) {
+          const topPct = Math.round((meRow.rank / meRow.total) * 100);
+          rankLine = `\n🎯 You: #${meRow.rank}/${meRow.total} — ${parseFloat(meRow.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
+        }
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
       } catch (err) {
         console.error("rank lookup error", err);
       }
 
+<<<<<<< HEAD
       // 🖼 generate PnL card
       const buffer = await generatePnLCard({
         playerName: play.username || "anon",
@@ -626,6 +875,24 @@ async function finishRound(round) {
         totalPlayers,
         totalPct: fin.total,
         selections: fin.rows
+=======
+      const lines = [
+        "🧾 Your Round Breakdown",
+        `Total: ${Number(fin.total).toFixed(2)}%`,
+        "",
+        "Token  | Dir | PnL%",
+        "----------------------"
+      ];
+      for (const r of fin.rows) {
+        const dir = r.direction === 'short' ? 'S' : 'L';
+        const label = (r.symbol || r.name || r.address || "?").toString().toUpperCase();
+        lines.push(`${label} | ${dir} | ${Number(r.pnl).toFixed(2)}%`);
+      }
+
+      await tgApi("sendMessage", {
+        chat_id: play.chat_id,
+        text: `${message}${rankLine}\n${lines.join("\n")}`
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
       });
 
       // send photo with caption
@@ -654,6 +921,10 @@ async function finishRound(round) {
 
 
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
 // ---------- Build Leaderboard ----------
 async function buildLeaderboard(roundId) {
   const { rows } = await pool.query(
@@ -771,6 +1042,48 @@ app.post("/telegram/webhook", async (req, res) => {
       }
     }
 
+    // Handle /about
+if (msg?.text?.startsWith("/about")) {
+  const chat_id = msg.chat.id;
+
+  const parts = [
+`🧠 About the Game and Creator
+
+I’m a long-time degen. Won some, lost some. I wanted a fun memecoin game that combines:
+1) A quick way to see what’s trending in the last 24h (no endless scrolling)
+2) Paper trading for all those “what if I took that trade” moments
+3) The option to go short (you can’t on new pairs)
+4) An even playing field to test pure shitcoin intuition
+5) Small rewards for being right`,
+
+`🎮 What is Degendle?
+A daily game to test your meme coin intuition without risking real money.
+
+• Each day the system builds a list of ~20 trending tokens (volume + newness).
+• You’ll be served 5 random tokens.
+• You have ~10s per token to choose: 📈 Long or 📉 Short.
+• After your 5 picks, your portfolio is submitted for the round.
+• When the round ends, we calculate PnL and post the Top 10.`,
+
+`🤖 Telegram bot = login layer
+Useful commands:
+/start – Get the web app button
+/live – Show your current round live PnL
+/leaderboard – Top 10 from the last finished round
+/timer – How long until the round ends`,
+
+`⚠️ Notes
+• Winnings are in SOL and paid manually for now.
+• No token, no wallet connect, no “airdrop.” If someone asks, it’s a scam.
+• DYOR — tokens shown are just the most traded of the day with some filters.`
+  ];
+
+  for (const p of parts) {
+    await tgApi("sendMessage", { chat_id, text: p });
+  }
+}
+
+
     // Handle /start
     if (msg?.text?.startsWith("/start")) {
       const chat_id = msg.chat.id;
@@ -779,7 +1092,7 @@ app.post("/telegram/webhook", async (req, res) => {
         text: "🚀 Degendle is ready. Tap to play:",
         reply_markup: {
           inline_keyboard: [[
-            { text: "🚀 Play Degendle", web_app: { url: FRONTEND_URL } }
+            { text: "🚀 Play Degendle", web_app: { url: PLAY_URL } }
           ]]
         }
       });
@@ -808,6 +1121,7 @@ app.post("/telegram/webhook", async (req, res) => {
       }
     }
 
+<<<<<<< HEAD
    // Handle /live
 if (msg?.text?.startsWith("/live")) {
   const chat_id = msg.chat.id;
@@ -823,10 +1137,24 @@ if (msg?.text?.startsWith("/live")) {
     const { rows } = await pool.query(
       `select coalesce(t.username, l.user_id::text) as username,
               l.pnl
+=======
+// /live
+if (msg?.text?.startsWith("/live")) {
+  const chat_id = msg.chat.id;
+  const userId = msg.from?.id?.toString();
+  const round = await getCurrentRound();
+
+  if (!round) {
+    await tgApi("sendMessage", { chat_id, text: "⏳ No active round right now." });
+  } else {
+    const { rows: top } = await pool.query(
+      `select coalesce(t.username, l.user_id::text) as username, l.user_id, l.pnl
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
        from live_pnl l
        left join telegram_users t on t.user_id::text = l.user_id::text
        where l.round_id = $1
        order by l.pnl desc
+<<<<<<< HEAD
        limit 10`,
       [round.id]
     );
@@ -895,8 +1223,136 @@ if (msg?.text?.startsWith("/live")) {
 
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
         await fetch(url, { method: "POST", body: formData });
+=======
+       limit 10`, [round.id]
+    );
+
+    if (!top.length) {
+      await tgApi("sendMessage", { chat_id, text: "No plays yet this round." });
+    } else {
+      const { rows: ranked } = await pool.query(
+        `select l.user_id, coalesce(t.username, l.user_id::text) as username, l.pnl,
+                row_number() over(order by l.pnl desc) as rank,
+                count(*) over() as total
+         from live_pnl l
+         left join telegram_users t on t.user_id::text = l.user_id::text
+         where l.round_id = $1
+         order by l.pnl desc`, [round.id]
+      );
+
+      let msgHtml = `📊 <b>Live Standings</b>\n<i>Ends ${new Date(round.round_end).toLocaleTimeString()}</i>\n\n`;
+      top.forEach((r,i) => {
+        msgHtml += `<code>${String(i+1).padStart(2,' ')}</code> ${esc(r.username)} — <b>${fmtP(r.pnl)}</b>\n`;
+      });
+
+      const me = ranked.find(r => r.user_id?.toString() === userId);
+      if (me) {
+        msgHtml += `\n👤 <b>You</b>\n• Position: <b>#${me.rank}/${me.total}</b>${topBadge(me.rank, me.total)}\n• PnL: <b>${fmtP(me.pnl)}</b>`;
+
+        try {
+          const { rows: picks } = await pool.query(
+            `select symbol, name, direction, entry_price, current_price, pnl
+             from live_pnl_detail
+             where round_id = $1 and user_id::text = $2::text
+             order by pnl desc`, [round.id, userId]
+          );
+          if (picks.length) {
+            msgHtml += `\n• Picks:\n`;
+            for (const p of picks) {
+              const label = esc((p.symbol || p.name || '').toUpperCase());
+              msgHtml += `  ▸ <b>${label}</b> — ${dirTxt(p.direction)} ` +
+                         `<code>${fmtUsd(p.entry_price)} → ${fmtUsd(p.current_price)}</code> • <b>${fmtP(p.pnl)}</b> ${pnlBlock(p.pnl)}\n`;
+            }
+          }
+        } catch(e){ console.error("live picks fetch error", e); }
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
       }
+
+      await tgApi("sendMessage", { chat_id, text: msgHtml, parse_mode: "HTML" });
     }
+<<<<<<< HEAD
+=======
+  }
+}
+
+
+
+
+// /leaderboard
+if (msg?.text?.startsWith("/leaderboard")) {
+  const chat_id = msg.chat.id;
+  const userId = msg.from?.id?.toString();
+
+  const { rows: lastRound } = await pool.query(
+    `select * from rounds where results_sent = true order by round_end desc limit 1`
+  );
+  if (!lastRound.length) {
+    await tgApi("sendMessage", { chat_id, text: "No finished rounds yet." });
+  } else {
+    const round = lastRound[0];
+
+    const { rows: top } = await pool.query(
+      `select coalesce(t.username, r.user_id::text) as username, r.user_id, r.pnl
+       from round_results r
+       left join telegram_users t on t.user_id::text = r.user_id::text
+       where r.round_id = $1
+       order by r.pnl desc
+       limit 10`, [round.id]
+    );
+
+    let msgHtml = `🏆 <b>Leaderboard</b>\n<i>Round ended at ${new Date(round.round_end).toLocaleTimeString()}</i>\n\n`;
+    top.forEach((r,i) => {
+      msgHtml += `<code>${String(i+1).padStart(2,' ')}</code> ${esc(r.username)} — <b>${fmtP(r.pnl)}</b>\n`;
+    });
+
+    // Your position
+    const { rows: ranked } = await pool.query(
+      `select r.user_id, r.pnl,
+              row_number() over(order by r.pnl desc) as rank,
+              count(*) over() as total
+       from round_results r
+       where r.round_id = $1
+       order by r.pnl desc`, [round.id]
+    );
+    const me = ranked.find(r => r.user_id?.toString() === userId);
+    if (me) {
+      msgHtml += `\n👤 <b>You</b>\n• Position: <b>#${me.rank}/${me.total}</b>${topBadge(me.rank, me.total)}\n• PnL: <b>${fmtP(me.pnl)}</b>`;
+
+      // per-pick final breakdown
+      try {
+        const { rows: meChoices } = await pool.query(
+          `select portfolio from round_results
+           where round_id = $1 and user_id::text = $2::text limit 1`, [round.id, userId]
+        );
+        if (meChoices.length) {
+          const selections = JSON.parse(meChoices[0].portfolio || "[]");
+          const addrs = [...new Set(selections.map(s => s.address).filter(Boolean))];
+          const priceMap = await firstLastPrices(addrs, round.round_start, round.round_end);
+          const decorated = decorateSelectionsWithPnl(selections, priceMap);
+
+          if (decorated.length) {
+            msgHtml += `\n• Picks:\n`;
+            for (const s of decorated) {
+              const label = esc((s.symbol || s.name || '').toUpperCase());
+              msgHtml += `  ▸ <b>${label}</b> — ${dirTxt(s.direction)} ` +
+                         `<code>${fmtUsd(s.entry ?? 0)} → ${fmtUsd(s.exit ?? 0)}</code> • <b>${fmtP(s.pnl ?? 0)}</b> ${pnlBlock(s.pnl ?? 0)}\n`;
+            }
+          }
+        }
+      } catch(e){ console.error("leaderboard picks breakdown error", e); }
+    }
+
+    await tgApi("sendMessage", { chat_id, text: msgHtml, parse_mode: "HTML" });
+  }
+}
+
+
+    // Acknowledge update
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("telegram/webhook error:", e);
+    res.status(200).json({ ok: true }); // don't retry forever
+>>>>>>> 10531a00cc79f1671c71aa2c90d57ca8a2a9f4c6
   }
 }
 
@@ -910,38 +1366,32 @@ if (msg?.text?.startsWith("/live")) {
 
 
 
-// ---------- Round helpers ----------
 async function createNewRound() {
   const now = new Date();
-  // Align start time to the current 10-minute block
   const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end = new Date(start.getTime() + 10 * 60 * 1000);
+  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // 1. Load today’s token list from daily_token_lists
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
     [today]
   );
-
   if (!rows.length) throw new Error("No daily tokens available. Did cron run?");
 
-  const tokenList = rows[0].tokens;
+  const pool20 = (rows[0].tokens || []).slice(0, 20);
 
-  // 2. Shuffle and pick 5 random tokens
-  const shuffled = tokenList.sort(() => 0.5 - Math.random());
-  const selected = shuffled.slice(0, 5);
-
-  // 3. Save new round into the 'rounds' table
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
      returning id, round_start, round_end, tokens`,
-    [start.toISOString(), end.toISOString(), JSON.stringify(selected)]
+    [start.toISOString(), end.toISOString(), JSON.stringify(pool20)]
   );
 
   return inserted[0];
 }
+
+
+
 
 // ---------- Get current active round ----------
 async function getCurrentRound() {
@@ -959,41 +1409,73 @@ async function getCurrentRound() {
 
 
 
-app.get("/rounds/current", async (_req, res) => {
+app.get("/rounds/current", async (req, res) => {
   try {
     let round = await getCurrentRound();
     if (!round) {
       round = await createNewRound();
     }
 
-    // Transform the raw Birdeye data to match frontend schema
-    const transformedTokens = (round.tokens || []).map(token => ({
-      address: token.address,
-      symbol: token.symbol,
-      name: token.name,
-      logoURI: token.logo_uri,  // logo_uri -> logoURI
-      price: token.price,
-      marketcap: token.market_cap,  // market_cap -> marketcap
-      liquidity: token.liquidity,
-      volume24h: token.volume_24h_usd,  // volume_24h_usd -> volume24h
-      priceChange24h: token.price_change_24h_percent,  // price_change_24h_percent -> priceChange24h
-      holders: token.holder,  // holder -> holders
-      top10HolderPercent: null, // Not available in meme list API
-      launchedAt: token.meme_info?.creation_time ? new Date(token.meme_info.creation_time * 1000).toISOString() : null,
-      updated_at: new Date().toISOString()
-    }));
+    // Map Birdeye fields -> frontend schema
+    const mapToken = (t) => ({
+      address: t.address,
+      symbol: t.symbol,
+      name: t.name,
+      logoURI: t.logo_uri,
+      price: t.price,
+      marketcap: t.market_cap,
+      liquidity: t.liquidity,
+      volume24h: t.volume_24h_usd,
+      priceChange24h: t.price_change_24h_percent,
+      holders: t.holder ?? null,
+      top10HolderPercent: null, // will be filled by enrichment
+      launchedAt: t.meme_info?.creation_time
+        ? new Date(t.meme_info.creation_time * 1000).toISOString()
+        : null,
+      updated_at: new Date().toISOString(),
+    });
+
+    // Legacy shared 5 (already saved in the round)
+    const transformedTokens = (round.tokens || []).map(mapToken);
+
+    // Build per-user order (≈20) from today's daily_token_lists
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows } = await pool.query(
+      `SELECT tokens FROM daily_token_lists WHERE round_date = $1 LIMIT 1`,
+      [today]
+    );
+
+    // Fallback if daily list missing
+    const dailyPoolRaw = rows.length ? rows[0].tokens : (round.tokens || []);
+
+    // Per-user deterministic shuffle (seeded by round + telegram user id)
+    const seed = `${round.id}:${req.tgUser?.id || "anon"}`;
+    const orderedRaw = deterministicShuffle(dailyPoolRaw, seed).slice(0, 20);
+    const ordered = orderedRaw.map(mapToken);
+
+    // Enrich BOTH arrays with holders/top10/launch info from token_cache
+    const [tokensEnriched, orderedEnriched] = await Promise.all([
+      enrichTokensWithCache(transformedTokens),
+      enrichTokensWithCache(ordered),
+    ]);
 
     res.json({
       id: round.id,
       start: round.round_start,
       end: round.round_end,
-      tokens: transformedTokens
+      tokens: tokensEnriched,     // shared 5 (back-compat)
+      ordered: orderedEnriched,   // per-user 20 (frontend will take first 5)
     });
   } catch (e) {
     console.error("Error fetching current round:", e);
     res.status(500).json({ error: "Failed to fetch current round" });
   }
 });
+
+
+
+
+
 
 
 
@@ -1037,15 +1519,16 @@ app.get("/tokens/:address/history", async (req, res) => {
   }
 });
 
-// ---------- WRITE: submit a play (with debug logs) ----------
-// ------ Save a play (user's selections) ----------
-// ---------- Save Player's Play ----------
-// === SAVE A PLAY ===
+// === SAVE A PLAY — one per user per round ===
 app.post("/plays", async (req, res) => {
   try {
-    const { user_id, username, selections } = req.body;
+    // Telegram-verified user (set by telegramAuth middleware)
+    const tgUserId = req.tgUser?.id ? String(req.tgUser.id) : null;
+    if (!tgUserId) {
+      return res.status(401).json({ ok: false, error: "Telegram auth required" });
+    }
 
-    // fetch current round
+    // Find the active round
     const { rows: [round] } = await pool.query(
       "SELECT id FROM rounds WHERE round_end > now() ORDER BY round_start LIMIT 1"
     );
@@ -1053,15 +1536,37 @@ app.post("/plays", async (req, res) => {
       return res.status(400).json({ ok: false, error: "No active round" });
     }
 
+    // Already submitted?
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM plays WHERE round_id = $1 AND user_id = $2 LIMIT 1`,
+      [round.id, tgUserId]
+    );
+    if (existing.length) {
+      return res.status(409).json({ ok: false, error: "ALREADY_PLAYED", playId: existing[0].id });
+    }
+
+    // Pull username + selections from body; server still validates user via header
+    const { username, selections } = req.body || {};
+    if (!Array.isArray(selections) || selections.length === 0) {
+      return res.status(400).json({ ok: false, error: "Invalid selections" });
+    }
+
+    // chat_id is optional (nullable in DB now)
+    const chat_id = req.tgUser?.id || null; // private chats: chat_id === user_id
+
     const playId = crypto.randomUUID();
     await pool.query(
       `INSERT INTO plays (id, round_id, user_id, chat_id, username, selections)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [playId, round.id, user_id, req.tgUser?.id || null, username, JSON.stringify(selections)]
+      [playId, round.id, tgUserId, chat_id, username || "anon", JSON.stringify(selections)]
     );
 
     res.json({ ok: true, playId });
   } catch (err) {
+    // If UNIQUE constraint is in place, catch race conditions gracefully
+    if (err?.code === "23505") {
+      return res.status(409).json({ ok: false, error: "ALREADY_PLAYED" });
+    }
     console.error("plays error", err);
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -1070,47 +1575,78 @@ app.post("/plays", async (req, res) => {
 
 
 
-
-
-
-// ---------- READ: leaderboard (24h cycle, ranked by PnL) ----------
-// ---------- Leaderboard ----------
-// ---------- Leaderboard ----------
-// ---------- Leaderboard API ----------
 app.get("/leaderboard", async (req, res) => {
   try {
-    // Find the most recent finished round
+    // find most recent finished round
     const { rows: rounds } = await pool.query(
-      `select id
+      `select id, round_start, round_end
        from rounds
        where round_end < now()
        order by round_end desc
        limit 1`
     );
+    if (!rounds.length) return res.json({ ok: true, entries: [], round_date: null, text: "No results yet." });
 
-    if (!rounds.length) {
-      return res.json({ ok: true, leaderboard: [] });
-    }
+    const round = rounds[0];
 
-    const roundId = rounds[0].id;
+    // Build leaderboard text (legacy string) for TG
+    const leaderboardText = await buildLeaderboard(round.id); // already exists :contentReference[oaicite:2]{index=2}
 
-    // Reuse buildLeaderboard()
-    const leaderboardText = await buildLeaderboard(roundId);
-
-    // Also return structured data for frontend
+    // Pull top N finished results with portfolios
     const { rows } = await pool.query(
-      `select t.username, r.pnl
+      `select r.user_id, coalesce(t.username, r.user_id::text) as username,
+              r.pnl, r.portfolio
        from round_results r
-       join telegram_users t on t.chat_id = r.chat_id
+       left join telegram_users t on t.user_id::text = r.user_id::text
        where r.round_id = $1
        order by r.pnl desc
        limit 10`,
-      [roundId]
+      [round.id]
     );
+
+    // Gather unique token addresses from top entries
+    const addresses = [...new Set(rows.flatMap(r => (JSON.parse(r.portfolio) || []).map(s => s.address)))];
+
+    // Price map for entry/exit
+    const priceMap = await firstLastPrices(addresses, round.round_start, round.round_end);
+
+    // Decorate selections with entry/exit/pnl and add counts
+    const entries = rows.map(r => {
+      const raw = JSON.parse(r.portfolio || "[]");
+      const selections = decorateSelectionsWithPnl(raw, priceMap);
+      const longs = selections.filter(s => s.direction === "long").length;
+      const shorts = selections.length - longs;
+      return {
+        user_id: r.user_id,
+        player: r.username,
+        pnl: Number(r.pnl),
+        longs,
+        shorts,
+        selections // [{address,symbol,name,logoURI,direction,entry,exit,pnl}]
+      };
+    });
+
+    // Add "me" (rank + pnl) if requester is a TG user
+    const meId = req.tgUser?.id?.toString() || null;
+    let me = null;
+    if (meId) {
+      const { rows: all } = await pool.query(
+        `select r.user_id, r.pnl,
+                row_number() over(order by r.pnl desc) as rank,
+                count(*) over() as total
+         from round_results r
+         where r.round_id = $1`,
+        [round.id]
+      );
+      const mine = all.find(x => x.user_id?.toString() === meId);
+      if (mine) me = { rank: Number(mine.rank), total: Number(mine.total), pnl: Number(mine.pnl) };
+    }
 
     res.json({
       ok: true,
-      leaderboard: rows,
+      round_date: new Date(round.round_end).toISOString().slice(0,10),
+      entries,
+      me,
       text: leaderboardText
     });
   } catch (e) {
@@ -1118,6 +1654,7 @@ app.get("/leaderboard", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
 
 
 // ---------- READ: live PnL for a round ----------
