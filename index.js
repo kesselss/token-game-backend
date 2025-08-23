@@ -1160,16 +1160,21 @@ if (msg?.text?.startsWith("/live")) {
         [round.id]
       );
 
-      let message = `📊 Live Standings (Round ends at ${new Date(round.round_end).toLocaleTimeString()})\n\n`;
+      const endTime = new Date(round.round_end).toLocaleTimeString();
+      let message = `📊 Live Standings\nEnds ${endTime}\n\n`;
       top.forEach((row, i) => {
         message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
       });
 
-      // Add "You:" line + per-pick breakdown (from live_pnl_detail which updateLivePnL keeps fresh)
+      // Add "You" section + per-pick breakdown
       const me = ranked.find(r => r.user_id?.toString() === userId);
       if (me) {
         const topPct = Math.round((me.rank / me.total) * 100);
-        message += `\n🎯 You: #${me.rank}/${me.total} — ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)`;
+
+        // header
+        message += `\nYou\n`;
+        message += `• Position: #${me.rank}/${me.total}\n`;
+        message += `• PnL: ${parseFloat(me.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
 
         try {
           const { rows: picks } = await pool.query(
@@ -1179,12 +1184,20 @@ if (msg?.text?.startsWith("/live")) {
              order by pnl desc`,
             [round.id, userId]
           );
+
           if (picks.length) {
-            message += `\n\n🧾 Your Picks (live)\nToken | Dir | Entry | Now | PnL%\n--------------------------------`;
+            message += `• Picks:\n`;
             for (const p of picks) {
               const label = (p.symbol || p.name || "").toUpperCase();
-              const dir = p.direction === 'short' ? 'S' : 'L';
-              message += `\n${label} | ${dir} | $${Number(p.entry_price).toFixed(6)} | $${Number(p.current_price).toFixed(6)} | ${Number(p.pnl).toFixed(2)}%`;
+              const word = p.direction === "short" ? "Short " : "Long  ";
+              const entry = `$${Number(p.entry_price ?? 0).toFixed(6)}`;
+              const now   = `$${Number(p.current_price ?? 0).toFixed(6)}`;
+              const pnl   = Number(p.pnl ?? 0);
+              const sign  = pnl >= 0 ? "+" : "";
+              const barsN = Math.max(1, Math.min(5, Math.round(Math.abs(pnl) / 5)));
+              const bars  = (pnl >= 0 ? "🟩" : "🟥").repeat(barsN);
+
+              message += `• ${label} — ${word} ${entry} → ${now}  ${sign}${pnl.toFixed(2)}% ${bars}\n`;
             }
           }
         } catch (e) {
@@ -1195,77 +1208,71 @@ if (msg?.text?.startsWith("/live")) {
       await tgApi("sendMessage", { chat_id, text: message });
 
       // --- ADD: PnL image reply (keep existing text above) ---
-try {
-  const chat_id = msg.chat.id;
-  const userId = msg.from?.id?.toString();
+      try {
+        const chat_id = msg.chat.id;
+        const userId = msg.from?.id?.toString();
 
-  // If you already have `round` in scope, reuse it. Otherwise fetch it:
-  const roundNow = typeof round !== "undefined" && round ? round : await getCurrentRound();
-  if (!roundNow) {
-    // no active round; nothing to render
-  } else {
-    // 1) Fetch this user’s live rank + total + pnl
-    const { rows: meRows } = await pool.query(
-      `select user_id, pnl,
-              row_number() over(order by pnl desc) as rank,
-              count(*) over() as total
-       from live_pnl
-       where round_id = $1`,
-      [roundNow.id]
-    );
-    const meRow = meRows.find(r => r.user_id?.toString() === userId) || null;
+        const roundNow = typeof round !== "undefined" && round ? round : await getCurrentRound();
+        if (!roundNow) {
+          // no active round
+        } else {
+          const { rows: meRows } = await pool.query(
+            `select user_id, pnl,
+                    row_number() over(order by pnl desc) as rank,
+                    count(*) over() as total
+             from live_pnl
+             where round_id = $1`,
+            [roundNow.id]
+          );
+          const meRow = meRows.find(r => r.user_id?.toString() === userId) || null;
 
-    // 2) Pull this user’s live picks (entry/exit/pnl)
-    const { rows: picks } = await pool.query(
-      `select address, symbol, name, logo, direction,
-              entry_price as entry, current_price as exit, pnl
-       from live_pnl_detail
-       where round_id = $1 and user_id::text = $2::text
-       order by pnl desc
-       limit 6`,
-       [roundNow.id, userId]
-    );
+          const { rows: picks } = await pool.query(
+            `select address, symbol, name, logo, direction,
+                    entry_price as entry, current_price as exit, pnl
+             from live_pnl_detail
+             where round_id = $1 and user_id::text = $2::text
+             order by pnl desc
+             limit 6`,
+             [roundNow.id, userId]
+          );
 
-    // 3) Build the image buffer (uses your ES module: generatePnLCard)
-    const buffer = await generatePnLCard({
-      playerName: msg.from?.username || msg.from?.first_name || "anon",
-      rank: meRow?.rank || 0,
-      totalPlayers: meRow?.total || 0,
-      totalPct: Number(meRow?.pnl ?? 0),
-      selections: picks.map(s => ({
-        symbol: s.symbol,
-        name: s.name,
-        logo: s.logo,           // assumes you store a URL in `logo`
-        direction: s.direction, // "long" | "short"
-        entry: Number(s.entry),
-        exit: Number(s.exit),
-        pnl: Number(s.pnl)
-      }))
-    });
+          const buffer = await generatePnLCard({
+            playerName: msg.from?.username || msg.from?.first_name || "anon",
+            rank: meRow?.rank || 0,
+            totalPlayers: meRow?.total || 0,
+            totalPct: Number(meRow?.pnl ?? 0),
+            selections: picks.map(s => ({
+              symbol: s.symbol,
+              name: s.name,
+              logo: s.logo,
+              direction: s.direction,
+              entry: Number(s.entry),
+              exit: Number(s.exit),
+              pnl: Number(s.pnl)
+            }))
+          });
 
-    // 4) Send image as a reply to the same message
-    const FormData = (await import("form-data")).default; // uses the same lib you already use elsewhere
-    const form = new FormData();
-    form.append("chat_id", String(chat_id));
-    form.append("reply_to_message_id", String(msg.message_id));
-    form.append("allow_sending_without_reply", "true");
-    form.append(
-      "caption",
-      `🎯 Your Live PnL — #${meRow?.rank || 0}/${meRow?.total || 0} (${(Number(meRow?.pnl ?? 0)).toFixed(2)}%)`
-    );
-    form.append("photo", buffer, { filename: "live_pnl.png", contentType: "image/png" });
+          const FormData = (await import("form-data")).default;
+          const form = new FormData();
+          form.append("chat_id", String(chat_id));
+          form.append("reply_to_message_id", String(msg.message_id));
+          form.append("allow_sending_without_reply", "true");
+          form.append(
+            "caption",
+            `🎯 Your Live PnL — #${meRow?.rank || 0}/${meRow?.total || 0} (${(Number(meRow?.pnl ?? 0)).toFixed(2)}%)`
+          );
+          form.append("photo", buffer, { filename: "live_pnl.png", contentType: "image/png" });
 
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
-    await fetch(url, { method: "POST", body: form });
-  }
-} catch (err) {
-  console.error("live->add card error:", err);
-  // stay silent to not spam users if the image fails
-}
-
+          const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+          await fetch(url, { method: "POST", body: form });
+        }
+      } catch (err) {
+        console.error("live->add card error:", err);
+      }
     }
   }
 }
+
 
 
 
