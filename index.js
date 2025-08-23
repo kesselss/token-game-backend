@@ -1016,15 +1016,16 @@ app.get("/tokens/:address/history", async (req, res) => {
   }
 });
 
-// ---------- WRITE: submit a play (with debug logs) ----------
-// ------ Save a play (user's selections) ----------
-// ---------- Save Player's Play ----------
-// === SAVE A PLAY ===
+// === SAVE A PLAY — one per user per round ===
 app.post("/plays", async (req, res) => {
   try {
-    const { user_id, username, selections } = req.body;
+    // Telegram-verified user (set by telegramAuth middleware)
+    const tgUserId = req.tgUser?.id ? String(req.tgUser.id) : null;
+    if (!tgUserId) {
+      return res.status(401).json({ ok: false, error: "Telegram auth required" });
+    }
 
-    // fetch current round
+    // Find the active round
     const { rows: [round] } = await pool.query(
       "SELECT id FROM rounds WHERE round_end > now() ORDER BY round_start LIMIT 1"
     );
@@ -1032,19 +1033,43 @@ app.post("/plays", async (req, res) => {
       return res.status(400).json({ ok: false, error: "No active round" });
     }
 
+    // Already submitted?
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM plays WHERE round_id = $1 AND user_id = $2 LIMIT 1`,
+      [round.id, tgUserId]
+    );
+    if (existing.length) {
+      return res.status(409).json({ ok: false, error: "ALREADY_PLAYED", playId: existing[0].id });
+    }
+
+    // Pull username + selections from body; server still validates user via header
+    const { username, selections } = req.body || {};
+    if (!Array.isArray(selections) || selections.length === 0) {
+      return res.status(400).json({ ok: false, error: "Invalid selections" });
+    }
+
+    // chat_id is optional (nullable in DB now)
+    const chat_id = req.tgUser?.id || null; // private chats: chat_id === user_id
+
     const playId = crypto.randomUUID();
     await pool.query(
       `INSERT INTO plays (id, round_id, user_id, chat_id, username, selections)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [playId, round.id, user_id, req.tgUser?.id || null, username, JSON.stringify(selections)]
+      [playId, round.id, tgUserId, chat_id, username || "anon", JSON.stringify(selections)]
     );
 
     res.json({ ok: true, playId });
   } catch (err) {
+    // If UNIQUE constraint is in place, catch race conditions gracefully
+    if (err?.code === "23505") {
+      return res.status(409).json({ ok: false, error: "ALREADY_PLAYED" });
+    }
     console.error("plays error", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+
 
 
 
