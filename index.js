@@ -300,6 +300,59 @@ await pool.query(q, vals);
 
 }
 
+// --- Price helpers ---
+async function getEntryAndCurrentPrices(address, round, { final=false } = {}) {
+  // entry = first price at/after round_start; fallback = last before start
+  const { rows: entry1 } = await pool.query(
+    `select price from token_history
+     where address = $1 and ts >= $2
+     order by ts asc limit 1`,
+    [address, round.round_start]
+  );
+  let entry = entry1[0]?.price;
+  if (entry == null) {
+    const { rows: entry2 } = await pool.query(
+      `select price from token_history
+       where address = $1 and ts < $2
+       order by ts desc limit 1`,
+      [address, round.round_start]
+    );
+    entry = entry2[0]?.price;
+  }
+
+  // current = last price up to now (live) or round_end (final), but not before start
+  const boundTs = final ? round.round_end : new Date().toISOString();
+  const { rows: cur1 } = await pool.query(
+    `select price from token_history
+     where address = $1 and ts >= $2 and ts <= $3
+     order by ts desc limit 1`,
+    [address, round.round_start, boundTs]
+  );
+  let current = cur1[0]?.price;
+
+  if (current == null) {
+    // fallback to token_cache.price if available
+    const { rows: cur2 } = await pool.query(
+      `select price from token_cache where address = $1 limit 1`,
+      [address]
+    );
+    current = cur2[0]?.price;
+  }
+
+  return {
+    entry: entry != null ? Number(entry) : null,
+    current: current != null ? Number(current) : null
+  };
+}
+
+function pickPnlPct(entry, current, direction) {
+  if (!entry || !current) return null;
+  const move = (current - entry) / entry * 100;
+  return direction === "short" ? -move : move;
+}
+
+
+
 async function insertHistoryRows(address, rows) {
   if (!rows.length) return;
   const values = rows.map((r, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`).join(",");
@@ -418,30 +471,65 @@ async function calculatePnL(selections, round) {
   return n ? total / n : 0;
 }
 
-// ---------- Update live PnL for an active round ----------
+// ---------- Update live PnL for an active round (with per-pick detail) ----------
 async function updateLivePnL(round) {
   // fetch all plays in this round
   const { rows: plays } = await pool.query(
-    `SELECT id, user_id, chat_id, selections
+    `SELECT user_id, selections
      FROM plays
      WHERE round_id = $1`,
     [round.id]
   );
 
   for (const play of plays) {
-    // calculate using your real calculatePnL
-    const pnl = await calculatePnL(play.selections, round);
+    const selections = Array.isArray(play.selections) ? play.selections : [];
+    let sum = 0, n = 0;
 
+    for (const pick of selections) {
+      const { address, symbol, name, logoURI, direction } = pick || {};
+      if (!address || !direction) continue;
+
+      const { entry, current } = await getEntryAndCurrentPrices(address, round, { final:false });
+      const pnl = pickPnlPct(entry, current, direction);
+
+      if (pnl != null) { sum += pnl; n += 1; }
+
+      // Upsert per-pick live detail
+      await pool.query(
+        `insert into live_pnl_detail
+          (round_id, user_id, address, symbol, name, logo, direction, entry_price, current_price, pnl)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         on conflict (round_id, user_id, address)
+         do update set
+           symbol        = excluded.symbol,
+           name          = excluded.name,
+           logo          = excluded.logo,
+           direction     = excluded.direction,
+           entry_price   = excluded.entry_price,
+           current_price = excluded.current_price,
+           pnl           = excluded.pnl,
+           last_updated  = now()`,
+        [
+          round.id, play.user_id, address,
+          symbol || null, name || null, logoURI || null,
+          direction, entry ?? 0, current ?? 0, pnl ?? 0
+        ]
+      );
+    }
+
+    const total = n ? (sum / n) : 0;
+
+    // Upsert total (keeps your existing table)
     await pool.query(
-      `INSERT INTO live_pnl (round_id, user_id, pnl)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (round_id, user_id)
-       DO UPDATE SET pnl = EXCLUDED.pnl, last_updated = now()`,
-      [round.id, play.user_id, pnl]
+      `insert into live_pnl (round_id, user_id, pnl)
+       values ($1, $2, $3)
+       on conflict (round_id, user_id)
+       do update set pnl = excluded.pnl, last_updated = now()`,
+      [round.id, play.user_id, total]
     );
   }
 
-  console.log(`📊 Updated live PnL for round ${round.id}`);
+  console.log(`📊 Updated live per-pick + totals for round ${round.id}`);
 }
 
 
@@ -500,7 +588,7 @@ async function finishRound(round) {
   try {
     console.log(`⚡ Finishing round ${round.id}`);
 
-    // 1. Fetch all plays for this round (chat_id comes directly from plays)
+    // 1) Fetch all plays for this round
     const { rows: plays } = await pool.query(
       `SELECT p.id, p.round_id, p.user_id, p.username, p.selections, p.chat_id
        FROM plays p
@@ -511,36 +599,143 @@ async function finishRound(round) {
     if (!plays.length) {
       console.log("No plays found for this round.");
       await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
-      // Clean up any leftover live_pnl just in case
       await pool.query(`DELETE FROM live_pnl WHERE round_id = $1`, [round.id]);
       return;
     }
 
-    // 2. Calculate final PnL for each play
-    for (const play of plays) {
-      const pnl = await calculatePnL(play.selections, round);
+    // Helper to get a price near a timestamp (fallbacks both sides + cache)
+    async function getPriceAtOrNear(address, tsIso, preferBefore = true) {
+      // prefer last price <= ts
+      if (preferBefore) {
+        const { rows: r1 } = await pool.query(
+          `select price from token_history
+           where address = $1 and ts <= $2
+           order by ts desc limit 1`,
+          [address, tsIso]
+        );
+        if (r1.length) return Number(r1[0].price);
+        const { rows: r2 } = await pool.query(
+          `select price from token_history
+           where address = $1 and ts >= $2
+           order by ts asc limit 1`,
+          [address, tsIso]
+        );
+        if (r2.length) return Number(r2[0].price);
+      } else {
+        // prefer first price >= ts
+        const { rows: r1 } = await pool.query(
+          `select price from token_history
+           where address = $1 and ts >= $2
+           order by ts asc limit 1`,
+          [address, tsIso]
+        );
+        if (r1.length) return Number(r1[0].price);
+        const { rows: r2 } = await pool.query(
+          `select price from token_history
+           where address = $1 and ts <= $2
+           order by ts desc limit 1`,
+          [address, tsIso]
+        );
+        if (r2.length) return Number(r2[0].price);
+      }
+      // final fallback: token_cache
+      const { rows: r3 } = await pool.query(
+        `select price from token_cache where address = $1 limit 1`,
+        [address]
+      );
+      return r3.length ? Number(r3[0].price) : null;
+    }
 
+    function pickPnlPct(entry, exit, direction) {
+      if (!entry || !exit) return null;
+      const move = ((exit - entry) / entry) * 100;
+      return direction === "short" ? -move : move;
+    }
+
+    // 2) For each play: compute per-pick PnL and total; save to round_results
+    for (const play of plays) {
+      const selections = Array.isArray(play.selections) ? play.selections : [];
+      let sum = 0, n = 0;
+      const finalRows = []; // for optional detail upsert + DM
+
+      for (const pick of selections) {
+        const { address, symbol, name, logoURI, direction } = pick || {};
+        if (!address || !direction) continue;
+
+        const entry = await getPriceAtOrNear(address, round.round_start, /*preferBefore=*/true);
+        const exit  = await getPriceAtOrNear(address, round.round_end,   /*preferBefore=*/true);
+        const pnl   = pickPnlPct(entry, exit, direction);
+
+        if (pnl != null) { sum += pnl; n += 1; }
+        finalRows.push({
+          address,
+          symbol: symbol || null,
+          name: name || null,
+          logo: logoURI || null,
+          direction,
+          entry_price: entry ?? 0,
+          current_price: exit ?? 0,
+          pnl: pnl ?? 0
+        });
+      }
+
+      const total = n ? (sum / n) : 0;
+
+      // Save/Upsert total to round_results (keeps your existing pipeline)
       await pool.query(
         `INSERT INTO round_results (round_id, user_id, chat_id, portfolio, pnl, choices)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (round_id, user_id) DO UPDATE
          SET portfolio = EXCLUDED.portfolio,
-             pnl = EXCLUDED.pnl,
-             choices = EXCLUDED.choices`,
+             pnl       = EXCLUDED.pnl,
+             choices   = EXCLUDED.choices`,
         [
           round.id,
           play.user_id,
           play.chat_id,
           JSON.stringify(play.selections),
-          pnl,
+          total,
           JSON.stringify(play.selections)
         ]
       );
+
+      // Optional: persist final per-pick rows into live_pnl_detail (if table exists)
+      // This makes /live (and audits) richer historically.
+      try {
+        for (const row of finalRows) {
+          await pool.query(
+            `insert into live_pnl_detail
+               (round_id, user_id, address, symbol, name, logo, direction, entry_price, current_price, pnl)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             on conflict (round_id, user_id, address)
+             do update set
+               symbol        = excluded.symbol,
+               name          = excluded.name,
+               logo          = excluded.logo,
+               direction     = excluded.direction,
+               entry_price   = excluded.entry_price,
+               current_price = excluded.current_price,
+               pnl           = excluded.pnl,
+               last_updated  = now()`,
+            [
+              round.id, play.user_id, row.address,
+              row.symbol, row.name, row.logo, row.direction,
+              row.entry_price, row.current_price, row.pnl
+            ]
+          );
+        }
+      } catch (e) {
+        // If the table doesn't exist, ignore silently (non-breaking)
+        if (e?.code !== '42P01') console.warn("live_pnl_detail upsert warning:", e.message);
+      }
+
+      // Attach breakdown for later DM send
+      play.__final = { total, rows: finalRows };
     }
 
     console.log(`✅ Round ${round.id} finished and results saved.`);
 
-    // 3. Build leaderboard for this round
+    // 3) Build leaderboard text for this round
     const { rows: leaderboard } = await pool.query(
       `SELECT COALESCE(t.username, r.user_id::text) AS username, r.pnl
        FROM round_results r
@@ -556,25 +751,39 @@ async function finishRound(round) {
       message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
-    // 4. Send results to every participant of this round
+    // 4) DM each participant: leaderboard + their per-pick breakdown
     for (const play of plays) {
+      if (!play.chat_id) continue;
+      const fin = play.__final || { total: 0, rows: [] };
+
+      const lines = [
+        "🧾 Your Round Breakdown",
+        `Total: ${Number(fin.total).toFixed(2)}%`,
+        "",
+        "Token  | Dir | PnL%",
+        "----------------------"
+      ];
+      for (const r of fin.rows) {
+        const dir = r.direction === 'short' ? 'S' : 'L';
+        const label = (r.symbol || r.name || r.address || "?").toString().toUpperCase();
+        lines.push(`${label} | ${dir} | ${Number(r.pnl).toFixed(2)}%`);
+      }
+
       await tgApi("sendMessage", {
         chat_id: play.chat_id,
-        text: message
+        text: `${message}\n\n${lines.join("\n")}`
       });
     }
 
-    // 5. Mark round as finished
+    // 5) Mark finished + cleanup live totals for this round
     await pool.query(`UPDATE rounds SET results_sent = true WHERE id = $1`, [round.id]);
-
-    // 6. Clean up live_pnl for this round
     await pool.query(`DELETE FROM live_pnl WHERE round_id = $1`, [round.id]);
     console.log(`🧹 Cleaned up live PnL for round ${round.id}`);
-
   } catch (err) {
     console.error("❌ Error finishing round:", err);
   }
 }
+
 
 
 
@@ -775,50 +984,74 @@ Useful commands:
       }
     }
 
-    // Handle /live
-    if (msg?.text?.startsWith("/live")) {
-      const chat_id = msg.chat.id;
-      const round = await getCurrentRound();
+    // Handle /live  → user's own per-pick breakdown + total
+if (msg?.text?.startsWith("/live")) {
+  const chat_id = msg.chat.id;
+  const userId  = msg.from?.id?.toString();
 
-      if (!round) {
-        await tgApi("sendMessage", {
-          chat_id,
-          text: "⏳ No active round right now. A new one will start soon!"
-        });
-      } else {
-        const { rows } = await pool.query(
-          `select coalesce(t.username, l.user_id::text) as username,
-                  l.pnl
-           from live_pnl l
-           left join telegram_users t on t.user_id::text = l.user_id::text
-           where l.round_id = $1
-           order by l.pnl desc
-           limit 10`,
-          [round.id]
+  const round = await getCurrentRound();
+  if (!round) {
+    await tgApi("sendMessage", {
+      chat_id,
+      text: "⏳ No active round right now. A new one will start soon!"
+    });
+  } else {
+    // Did this user play?
+    const { rows: played } = await pool.query(
+      `select 1 from plays where round_id=$1 and user_id::text=$2 limit 1`,
+      [round.id, userId]
+    );
+    if (!played.length) {
+      await tgApi("sendMessage", { chat_id, text: "You haven't submitted picks this round." });
+    } else {
+      // Get (or compute) their per-pick live table
+      let { rows: detail } = await pool.query(
+        `select address, coalesce(symbol,'?') as symbol, coalesce(name,'') as name,
+                coalesce(direction,'?') as direction, pnl
+         from live_pnl_detail
+         where round_id=$1 and user_id::text=$2
+         order by symbol`,
+        [round.id, userId]
+      );
+
+      // Fallback: if detail not populated yet, compute quickly on the fly
+      if (!detail.length) {
+        const { rows: p } = await pool.query(
+          `select selections from plays where round_id=$1 and user_id::text=$2 limit 1`,
+          [round.id, userId]
         );
-
-        if (!rows.length) {
-          await tgApi("sendMessage", {
-            chat_id,
-            text: "No plays yet this round."
-          });
-        } else {
-          let message = `📊 Live Standings (Round ends at ${new Date(
-            round.round_end
-          ).toLocaleTimeString()})\n\n`;
-          rows.forEach((row, i) => {
-            message += `${i + 1}. ${row.username} — ${parseFloat(
-              row.pnl
-            ).toFixed(2)}%\n`;
-          });
-
-          await tgApi("sendMessage", {
-            chat_id,
-            text: message
-          });
+        const selections = p[0]?.selections || [];
+        const tmp = [];
+        for (const pick of selections) {
+          const { entry, current } = await getEntryAndCurrentPrices(pick.address, round, { final:false });
+          const pnl = pickPnlPct(entry, current, pick.direction) ?? 0;
+          tmp.push({ address: pick.address, symbol: pick.symbol, name: pick.name, direction: pick.direction, pnl });
         }
+        detail = tmp;
       }
+
+      // Pull the user's total from live_pnl
+      const { rows: totalRow } = await pool.query(
+        `select pnl from live_pnl where round_id=$1 and user_id::text=$2 limit 1`,
+        [round.id, userId]
+      );
+      const total = totalRow[0]?.pnl ?? 0;
+
+      // Build message
+      const endsAt = new Date(round.round_end).toLocaleTimeString();
+      let text = `📊 Your Live PnL (ends ${endsAt})\nTotal: ${Number(total).toFixed(2)}%\n\n`;
+      text += `Token  | Dir | PnL%\n`;
+      text += `----------------------\n`;
+      for (const r of detail) {
+        const dir = r.direction === 'short' ? 'S' : 'L';
+        text += `${(r.symbol || r.name || r.address).toUpperCase()} | ${dir} | ${Number(r.pnl).toFixed(2)}%\n`;
+      }
+
+      await tgApi("sendMessage", { chat_id, text });
     }
+  }
+}
+
 
     // Handle /leaderboard
     if (msg?.text?.startsWith("/leaderboard")) {
