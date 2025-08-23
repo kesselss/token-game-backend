@@ -22,7 +22,7 @@ const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || FRONTEND_ORIGIN; // fallback
 
 
-// ---------- DB ----------
+// ---------- DB ----------OKay 
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -208,7 +208,23 @@ async function fetchTopMemeTokens(limit = 20, minVolume = 10000, minMarketCap = 
   return json?.data?.items || [];
 }
 
-
+function seededShuffle(arr, seedStr) {
+  // Tiny mulberry32 PRNG
+  let seed = 0;
+  for (let i = 0; i < seedStr.length; i++) seed = (seed * 31 + seedStr.charCodeAt(i)) >>> 0;
+  function rnd() { // 0..1
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t ^= t + Math.imul(t ^ t >>> 7, 61 | t);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 
 async function beJson(url) {
   const res = await fetch(url, { headers: BE_HEADERS });
@@ -1185,60 +1201,55 @@ async function getCurrentRound() {
 
 
 
-// ---------- Get current active round (user-specific order) ----------
 app.get("/rounds/current", async (req, res) => {
   try {
-    // Get (or lazily create) the active round
     let round = await getCurrentRound();
-    if (!round) {
-      round = await createNewRound();
-    }
+    if (!round) round = await createNewRound(); // defines start/end only
 
-    // IMPORTANT: 'round.tokens' now stores the ~20-token *pool* for the day.
-    // (If your round currently has only 5, this still works; we’ll just shuffle those.)
-    const poolRaw = Array.isArray(round.tokens) ? round.tokens : [];
+    // pull today's full 20-token pool from daily_token_lists
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows: dl } = await pool.query(
+      `select tokens from daily_token_lists where round_date = $1 limit 1`,
+      [today]
+    );
+    const pool = (dl[0]?.tokens || []);
 
-    // Transform Birdeye fields to your frontend schema
-    const pool = poolRaw.map(token => ({
+    // map Birdeye fields -> frontend fields (same mapping you already use)
+    const transform = (token) => ({
       address: token.address,
       symbol: token.symbol,
-      name: token.name || "Unknown",
-      logoURI: token.logo_uri || token.logo || "",
+      name: token.name,
+      logoURI: token.logo_uri,
       price: token.price,
-      marketcap: token.market_cap ?? token.marketcap,
+      marketcap: token.market_cap,
       liquidity: token.liquidity,
-      volume24h: token.volume_24h_usd ?? token.volume24h,
-      priceChange24h: token.price_change_24h_percent ?? token.priceChange24h,
-      holders: token.holder ?? token.holders,
+      volume24h: token.volume_24h_usd,
+      priceChange24h: token.price_change_24h_percent,
+      holders: token.holder,
       top10HolderPercent: null,
       launchedAt: token.meme_info?.creation_time
         ? new Date(token.meme_info.creation_time * 1000).toISOString()
-        : token.launchedAt || null,
+        : null,
       updated_at: new Date().toISOString()
-    }));
+    });
 
-    // Derive a deterministic order for this user
-    // NOTE: we rely on your telegramAuth middleware that sets req.tgUser (already in file).
+    const transformedPool = pool.map(transform);
+
+    // make a per-user deterministic order
     const userId = req.tgUser?.id ? String(req.tgUser.id) : "anon";
-    const seed = hash32(`${round.id}:${userId}`);
-    const ordered = seededShuffle(pool.slice(0, 20), seed); // cap at 20
+    const ordered = seededShuffle(transformedPool, `${round.id}:${userId}`);
 
-    // First 5 are the initial set the client shows
-    const firstFive = ordered.slice(0, 5);
-
+    // keep 'tokens' for backward-compat, but NOW derive it from the ordered list
     res.json({
-      ok: true,
-      round: {
-        id: round.id,
-        start: round.round_start,
-        end: round.round_end
-      },
-      tokens: firstFive,
+      id: round.id,
+      start: round.round_start,
+      end: round.round_end,
+      tokens: ordered.slice(0, 5),
       ordered
     });
   } catch (e) {
-    console.error("rounds/current error", e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("Error fetching current round:", e);
+    res.status(500).json({ error: "Failed to fetch current round" });
   }
 });
 
