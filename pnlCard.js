@@ -114,7 +114,8 @@ export async function generatePnLCard({
   // ---------- Header ----------
   ctx.fillStyle = "#ffd54a";
   ctx.font = `700 34px ${fontFamily}`;
-  ctx.fillText(`📊 ${title}`, 40, 70);
+  ctx.fillText(title, 40, 70);
+
 
   // Player + rank
   ctx.fillStyle = "#ffffff";
@@ -139,8 +140,9 @@ export async function generatePnLCard({
   // Optional “Long/Short mix” chip
   const longCount = selections.filter(s => s?.direction === "long").length;
   const shortCount = selections.filter(s => s?.direction === "short").length;
-  drawChip(`📈 ${longCount} long`, 40, 228, "#1ee3b1");
-  drawChip(`📉 ${shortCount} short`, 150, 228, "#ff9da1");
+drawChip(`${longCount} long`, 40, 228, "#1ee3b1");
+drawChip(`${shortCount} short`, 150, 228, "#ff9da1");
+
 
   // ---------- Table ----------
   const cardX = 32;
@@ -214,7 +216,7 @@ export async function generatePnLCard({
     if (nm) ctx.fillText(nm, colSymbolX, y + 8);
 
     // Direction
-    const dir = r.direction === "short" ? "📉 SHORT" : "📈 LONG";
+    const dir = r.direction === "short" ? "SHORT" : "LONG";
     ctx.fillStyle = r.direction === "short" ? "#ff9da1" : "#1ee3b1";
     ctx.font = `700 18px ${fontFamily}`;
     ctx.fillText(dir, colDirX, y - 10);
