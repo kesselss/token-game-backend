@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
+const PLAY_URL = "https://degendle.com/daily-game/";
 
 
 // ---------- Telegram constants & helper ----------
@@ -447,8 +448,9 @@ async function updateLivePnL(round) {
 
 async function startNewRound() {
   const now = new Date();
-  const start = new Date(Math.floor(now.getTime() / (10 * 60 * 1000)) * (10 * 60 * 1000));
-  const end = new Date(start.getTime() + 10 * 60 * 1000);
+  // Align to the current hour block
+  const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
+  const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
   // Load today's token list
   const today = new Date().toISOString().slice(0, 10);
@@ -477,7 +479,7 @@ async function startNewRound() {
     try {
       await tgApi("sendMessage", {
         chat_id: u.chat_id,
-        text: `🚀 New round has started!\nYou have 10 minutes to play.\n\nTap to join:`,
+        text: `🚀 New round has started!\nYou have 1 hour to play.\n\nTap to join:`,
         reply_markup: {
           inline_keyboard: [[
             { text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }
@@ -694,6 +696,48 @@ app.post("/telegram/webhook", async (req, res) => {
       }
     }
 
+    // Handle /about
+if (msg?.text?.startsWith("/about")) {
+  const chat_id = msg.chat.id;
+
+  const parts = [
+`🧠 About the Game and Creator
+
+I’m a long-time degen. Won some, lost some. I wanted a fun memecoin game that combines:
+1) A quick way to see what’s trending in the last 24h (no endless scrolling)
+2) Paper trading for all those “what if I took that trade” moments
+3) The option to go short (you can’t on new pairs)
+4) An even playing field to test pure shitcoin intuition
+5) Small rewards for being right`,
+
+`🎮 What is Degendle?
+A daily game to test your meme coin intuition without risking real money.
+
+• Each day the system builds a list of ~20 trending tokens (volume + newness).
+• You’ll be served 5 random tokens.
+• You have ~10s per token to choose: 📈 Long or 📉 Short.
+• After your 5 picks, your portfolio is submitted for the round.
+• When the round ends, we calculate PnL and post the Top 10.`,
+
+`🤖 Telegram bot = login layer
+Useful commands:
+/start – Get the web app button
+/live – Show your current round live PnL
+/leaderboard – Top 10 from the last finished round
+/timer – How long until the round ends`,
+
+`⚠️ Notes
+• Winnings are in SOL and paid manually for now.
+• No token, no wallet connect, no “airdrop.” If someone asks, it’s a scam.
+• DYOR — tokens shown are just the most traded of the day with some filters.`
+  ];
+
+  for (const p of parts) {
+    await tgApi("sendMessage", { chat_id, text: p });
+  }
+}
+
+
     // Handle /start
     if (msg?.text?.startsWith("/start")) {
       const chat_id = msg.chat.id;
@@ -702,7 +746,7 @@ app.post("/telegram/webhook", async (req, res) => {
         text: "🚀 Degendle is ready. Tap to play:",
         reply_markup: {
           inline_keyboard: [[
-            { text: "🚀 Play Degendle", web_app: { url: FRONTEND_URL } }
+            { text: "🚀 Play Degendle", web_app: { url: PLAY_URL } }
           ]]
         }
       });
@@ -846,29 +890,27 @@ app.post("/telegram/webhook", async (req, res) => {
 
 
 
-// ---------- Round helpers ----------
 async function createNewRound() {
   const now = new Date();
-  // Align start time to the current 10-minute block
+  // Align to the current hour block
   const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end = new Date(start.getTime() + 10 * 60 * 1000);
+  const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
-  // 1. Load today’s token list from daily_token_lists
+  // 1) Load today’s token list
   const today = new Date().toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
     [today]
   );
-
   if (!rows.length) throw new Error("No daily tokens available. Did cron run?");
 
   const tokenList = rows[0].tokens;
 
-  // 2. Shuffle and pick 5 random tokens
+  // 2) Shuffle and pick 5 tokens
   const shuffled = tokenList.sort(() => 0.5 - Math.random());
   const selected = shuffled.slice(0, 5);
 
-  // 3. Save new round into the 'rounds' table
+  // 3) Save new round
   const { rows: inserted } = await pool.query(
     `insert into rounds (round_start, round_end, tokens)
      values ($1, $2, $3)
@@ -878,6 +920,7 @@ async function createNewRound() {
 
   return inserted[0];
 }
+
 
 // ---------- Get current active round ----------
 async function getCurrentRound() {
