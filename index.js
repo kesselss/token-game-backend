@@ -444,6 +444,30 @@ await pool.query(q, vals);
 
 }
 
+// ADD this helper anywhere in index.js (alongside your other utility functions)
+function formatPickLine({ label, direction, entry, exit, pnl }) {
+  function fmtPrice(p) {
+    if (p == null || Number.isNaN(Number(p))) return "N/A";
+    const abs = Math.abs(Number(p));
+    const d = abs >= 1 ? 2 : abs >= 0.1 ? 3 : abs >= 0.01 ? 4 : 6;
+    return `$${Number(p).toFixed(d)}`;
+  }
+  function blocksFor(pct) {
+    const abs = Math.abs(pct);
+    const n = abs >= 10 ? 3 : abs >= 5 ? 2 : abs >= 1 ? 1 : 0;
+    const block = pct >= 0 ? "🟩" : "🟥";
+    return n ? " " + block.repeat(n) : "";
+  }
+
+  const dirWord = direction === "short" ? "Short" : "Long";
+  const arrow = "→";
+  const pct = Number(pnl ?? 0);
+  const pctStr = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
+
+  return `• ${label} — ${dirWord} ${fmtPrice(entry)} ${arrow} ${fmtPrice(exit)} ${pctStr}${blocksFor(pct)}`;
+}
+
+
 // --- Price helpers ---
 async function getEntryAndCurrentPrices(address, round, { final=false } = {}) {
   // entry = first price at/after round_start; fallback = last before start
@@ -716,7 +740,7 @@ async function startNewRound() {
 
 
 
-// === FINISH A ROUND ===
+// REPLACE your existing finishRound with this version
 async function finishRound(round) {
   try {
     console.log(`⚡ Finishing round ${round.id}`);
@@ -736,9 +760,72 @@ async function finishRound(round) {
       return;
     }
 
-    // --- price helpers + pickPnlPct (unchanged) ---
-    async function getPriceAtOrNear(address, tsIso, preferBefore = true) { /* ... same as you pasted ... */ }
-    function pickPnlPct(entry, exit, direction) { /* ... same as you pasted ... */ }
+    // --- helpers local to this function ---
+    async function getPriceAtOrNear(address, tsIso, preferBefore = true) {
+      // first at/after timestamp
+      const { rows: after } = await pool.query(
+        `select price, ts
+           from token_history
+          where address = $1 and ts >= $2
+          order by ts asc
+          limit 1`,
+        [address, tsIso]
+      );
+      // last before timestamp
+      const { rows: before } = await pool.query(
+        `select price, ts
+           from token_history
+          where address = $1 and ts < $2
+          order by ts desc
+          limit 1`,
+        [address, tsIso]
+      );
+
+      let pick = null;
+      if (preferBefore) {
+        pick = before[0] ?? after[0] ?? null;
+      } else {
+        pick = after[0] ?? before[0] ?? null;
+      }
+
+      if (!pick) {
+        // fallback to token_cache if history is empty
+        const { rows: cache } = await pool.query(
+          `select price from token_cache where address = $1 limit 1`,
+          [address]
+        );
+        return cache[0] ? Number(cache[0].price) : null;
+      }
+      return Number(pick.price);
+    }
+
+    function pnlPct(entry, exit, direction) {
+      if (entry == null || exit == null) return null;
+      const move = ((exit - entry) / entry) * 100;
+      return direction === "short" ? -move : move;
+    }
+
+    function formatPickLine({ label, direction, entry, exit, pnl }) {
+      function fmtPrice(p) {
+        if (p == null || Number.isNaN(Number(p))) return "N/A";
+        const abs = Math.abs(Number(p));
+        const d = abs >= 1 ? 2 : abs >= 0.1 ? 3 : abs >= 0.01 ? 4 : 6;
+        return `$${Number(p).toFixed(d)}`;
+      }
+      function blocksFor(pct) {
+        const abs = Math.abs(pct);
+        const n = abs >= 10 ? 3 : abs >= 5 ? 2 : abs >= 1 ? 1 : 0;
+        const block = pct >= 0 ? "🟩" : "🟥";
+        return n ? " " + block.repeat(n) : "";
+      }
+
+      const dirWord = direction === "short" ? "Short" : "Long";
+      const arrow = "→";
+      const pct = Number(pnl ?? 0);
+      const pctStr = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
+
+      return `• ${label} — ${dirWord} ${fmtPrice(entry)} ${arrow} ${fmtPrice(exit)} ${pctStr}${blocksFor(pct)}`;
+    }
 
     // 2) For each play: compute per-pick PnL and total; save to round_results
     for (const play of plays) {
@@ -751,8 +838,8 @@ async function finishRound(round) {
         if (!address || !direction) continue;
 
         const entry = await getPriceAtOrNear(address, round.round_start, true);
-        const exit  = await getPriceAtOrNear(address, round.round_end,   true);
-        const pnl   = pickPnlPct(entry, exit, direction);
+        const exit  = await getPriceAtOrNear(address, round.round_end,   false);
+        const pnl   = pnlPct(entry, exit, direction);
 
         if (pnl != null) { sum += pnl; n += 1; }
         finalRows.push({
@@ -780,12 +867,13 @@ async function finishRound(round) {
           round.id,
           play.user_id,
           play.chat_id,
-          JSON.stringify(play.selections),
+          JSON.stringify(finalRows),
           total,
-          JSON.stringify(play.selections)
+          JSON.stringify(selections)
         ]
       );
 
+      // store to use later when DM'ing the player
       play.__final = { total, rows: finalRows };
     }
 
@@ -794,11 +882,11 @@ async function finishRound(round) {
     // 3) Build leaderboard text for this round
     const { rows: leaderboard } = await pool.query(
       `SELECT COALESCE(t.username, r.user_id::text) AS username, r.pnl, r.user_id
-       FROM round_results r
-       LEFT JOIN telegram_users t ON t.user_id::text = r.user_id::text
-       WHERE r.round_id = $1
-       ORDER BY r.pnl DESC
-       LIMIT 10`,
+         FROM round_results r
+    LEFT JOIN telegram_users t ON t.user_id::text = r.user_id::text
+        WHERE r.round_id = $1
+     ORDER BY r.pnl DESC
+        LIMIT 10`,
       [round.id]
     );
 
@@ -807,20 +895,20 @@ async function finishRound(round) {
       message += `${i + 1}. ${row.username} — ${parseFloat(row.pnl).toFixed(2)}%\n`;
     });
 
-    // 4) DM each participant: leaderboard + their personal rank + breakdown
+    // 4) DM each participant: leaderboard + their personal rank + breakdown (bullet style like /live)
     for (const play of plays) {
       if (!play.chat_id) continue;
       const fin = play.__final || { total: 0, rows: [] };
 
-      // fetch this player’s rank + total
+      // fetch this player's rank + total
       let rankLine = "";
       try {
         const { rows: [meRow] } = await pool.query(
           `select r.pnl,
                   row_number() over(order by r.pnl desc) as rank,
                   count(*) over() as total
-           from round_results r
-           where r.round_id = $1 and r.user_id::text = $2::text`,
+             from round_results r
+            where r.round_id = $1 and r.user_id::text = $2::text`,
           [round.id, play.user_id]
         );
         if (meRow) {
@@ -828,25 +916,33 @@ async function finishRound(round) {
           rankLine = `\n🎯 You: #${meRow.rank}/${meRow.total} — ${parseFloat(meRow.pnl).toFixed(2)}% (Top ${topPct}%)\n`;
         }
       } catch (err) {
-        console.error("rank lookup error", err);
+        console.error("rank fetch error", err);
       }
 
-      const lines = [
+      const intro = [
         "🧾 Your Round Breakdown",
         `Total: ${Number(fin.total).toFixed(2)}%`,
         "",
-        "Token  | Dir | PnL%",
-        "----------------------"
+        "Picks:"
       ];
+
+      const pickLines = [];
       for (const r of fin.rows) {
-        const dir = r.direction === 'short' ? 'S' : 'L';
         const label = (r.symbol || r.name || r.address || "?").toString().toUpperCase();
-        lines.push(`${label} | ${dir} | ${Number(r.pnl).toFixed(2)}%`);
+        pickLines.push(
+          formatPickLine({
+            label,
+            direction: r.direction,
+            entry: r.entry_price,
+            exit: r.current_price,
+            pnl: r.pnl
+          })
+        );
       }
 
       await tgApi("sendMessage", {
         chat_id: play.chat_id,
-        text: `${message}${rankLine}\n${lines.join("\n")}`
+        text: `${message}${rankLine}\n${[...intro, ...pickLines].join("\n")}`
       });
     }
 
@@ -858,6 +954,8 @@ async function finishRound(round) {
     console.error("❌ Error finishing round:", err);
   }
 }
+
+
 
 
 
