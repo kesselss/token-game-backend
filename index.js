@@ -702,12 +702,16 @@ async function updateLivePnL(round) {
 
 
 
+// === 24H ROUND, ANCHORED TO UTC MIDNIGHT ===
 async function startNewRound() {
+  // Round runs from today 00:00:00 UTC to tomorrow 00:00:00 UTC
   const now = new Date();
-  const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
+  const start = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0
+  ));
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = start.toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
     [today]
@@ -723,13 +727,13 @@ async function startNewRound() {
     [start.toISOString(), end.toISOString(), JSON.stringify(pool20)]
   );
 
-  // notify users (copy as-is)
+  // notify users
   const { rows: users } = await pool.query(`select chat_id from telegram_users`);
   for (const u of users) {
     try {
       await tgApi("sendMessage", {
         chat_id: u.chat_id,
-        text: `🚀 New round has started!\nYou have 1 hour to play.\n\nTap to join:`,
+        text: `🚀 New round has started!\nYou have 24 hours to play.\n\nTap to join:`,
         reply_markup: { inline_keyboard: [[{ text: "🎮 Play Now", web_app: { url: FRONTEND_URL } }]] }
       });
     } catch (e) { console.error("notify fail", u.chat_id, e.message); }
@@ -737,6 +741,7 @@ async function startNewRound() {
 
   return inserted[0];
 }
+
 
 
 
@@ -1241,7 +1246,7 @@ if (msg?.text?.startsWith("/live")) {
       );
 
       const endTime = new Date(round.round_end).toLocaleTimeString();
-      let message = `<b>📊 Live Standings</b>\nEnds ${endTime}\n\n`;
+      let message = `📊 Live Standings (updates ~10m, round ends at ${new Date(round.round_end).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC)\n\n`;
       top.forEach((row, i) => {
         message += `${i + 1}. <b>${row.username}</b> — <b>${parseFloat(row.pnl).toFixed(2)}%</b>\n`;
       });
@@ -1485,12 +1490,16 @@ if (msg?.text?.startsWith("/leaderboard")) {
 
 
 
+// === 24H ROUND FALLBACK CREATOR (used by /rounds/current when none exists) ===
 async function createNewRound() {
+  // Round runs from today 00:00:00 UTC to tomorrow 00:00:00 UTC
   const now = new Date();
-  const start = new Date(Math.floor(now.getTime() / (60 * 60 * 1000)) * (60 * 60 * 1000));
-  const end   = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
+  const start = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0
+  ));
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = start.toISOString().slice(0, 10);
   const { rows } = await pool.query(
     `select tokens from daily_token_lists where round_date = $1 limit 1`,
     [today]
@@ -1508,6 +1517,7 @@ async function createNewRound() {
 
   return inserted[0];
 }
+
 
 
 
