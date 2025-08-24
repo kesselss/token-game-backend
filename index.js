@@ -1142,6 +1142,30 @@ Useful commands:
 }
 
 
+// --- /community ---
+if (msg?.text?.startsWith("/community")) {
+  const chat_id = msg.chat.id;
+  await tgApi("sendMessage", {
+    chat_id,
+    text: "👋 Join our community channel:\nhttps://t.me/degendle",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🌐 Open Community", url: "https://t.me/degendle" }]
+      ]
+    }
+  });
+}
+
+// --- /rewards ---
+if (msg?.text?.startsWith("/rewards")) {
+  const chat_id = msg.chat.id;
+  const text =
+    "Winnings are currently paid in SOL, minimum 10 players per round is required. Winners can request winnings on /community channels.  For now, only 0.1 SOL for winner and 0.05 for 2nd and 0.03 for third. Will increase winnings as player base increases so be sure to invite your friends!";
+  await tgApi("sendMessage", { chat_id, text });
+}
+
+
     // Handle /start
     if (msg?.text?.startsWith("/start")) {
       const chat_id = msg.chat.id;
