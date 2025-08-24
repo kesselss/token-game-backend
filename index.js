@@ -760,50 +760,7 @@ async function finishRound(round) {
       return;
     }
 
-    // --- helpers local to this function ---
-    async function getPriceAtOrNear(address, tsIso, preferBefore = true) {
-      // first at/after timestamp
-      const { rows: after } = await pool.query(
-        `select price, ts
-           from token_history
-          where address = $1 and ts >= $2
-          order by ts asc
-          limit 1`,
-        [address, tsIso]
-      );
-      // last before timestamp
-      const { rows: before } = await pool.query(
-        `select price, ts
-           from token_history
-          where address = $1 and ts < $2
-          order by ts desc
-          limit 1`,
-        [address, tsIso]
-      );
 
-      let pick = null;
-      if (preferBefore) {
-        pick = before[0] ?? after[0] ?? null;
-      } else {
-        pick = after[0] ?? before[0] ?? null;
-      }
-
-      if (!pick) {
-        // fallback to token_cache if history is empty
-        const { rows: cache } = await pool.query(
-          `select price from token_cache where address = $1 limit 1`,
-          [address]
-        );
-        return cache[0] ? Number(cache[0].price) : null;
-      }
-      return Number(pick.price);
-    }
-
-    function pnlPct(entry, exit, direction) {
-      if (entry == null || exit == null) return null;
-      const move = ((exit - entry) / entry) * 100;
-      return direction === "short" ? -move : move;
-    }
 
     function formatPickLine({ label, direction, entry, exit, pnl }) {
       function fmtPrice(p) {
@@ -837,21 +794,22 @@ async function finishRound(round) {
         const { address, symbol, name, logoURI, direction } = pick || {};
         if (!address || !direction) continue;
 
-        const entry = await getPriceAtOrNear(address, round.round_start, true);
-        const exit  = await getPriceAtOrNear(address, round.round_end,   false);
-        const pnl   = pnlPct(entry, exit, direction);
+// Use the shared, working helpers for final prices
+const { entry, current } = await getEntryAndCurrentPrices(address, round, { final: true });
+const pnl = pickPnlPct(entry, current, direction);
 
-        if (pnl != null) { sum += pnl; n += 1; }
-        finalRows.push({
-          address,
-          symbol: symbol || null,
-          name: name || null,
-          logo: logoURI || null,
-          direction,
-          entry_price: entry ?? 0,
-          current_price: exit ?? 0,
-          pnl: pnl ?? 0
-        });
+if (pnl != null) { sum += pnl; n += 1; }
+finalRows.push({
+  address,
+  symbol: symbol || null,
+  name: name || null,
+  logo: logoURI || null,
+  direction,
+  entry_price: entry ?? 0,
+  current_price: current ?? 0,
+  pnl: pnl ?? 0
+});
+
       }
 
       const total = n ? (sum / n) : 0;
